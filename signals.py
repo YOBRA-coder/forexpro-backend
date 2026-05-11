@@ -1,0 +1,312 @@
+"""
+Market Data Engine
+- Primary: Twelve Data free API (800 req/day free, real forex OHLCV)
+- Fallback: Realistic synthetic data (GBM + market cycles)
+- All technical indicators computed in-house (no external TA lib needed)
+"""
+import math, hashlib, json
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Optional
+import urllib.request, urllib.error
+
+# ── Twelve Data free API (no key needed for basic quotes) ─────────────────────
+TWELVE_DATA_KEY = ""  # Optional: get free key at twelvedata.com for more calls
+
+PAIR_CONFIG = {
+    "EURUSD": (1.0850, 0.0050, 0.0001, 1.2, "EUR/USD"),
+    "GBPUSD": (1.2700, 0.0080, 0.0001, 1.4, "GBP/USD"),
+    "USDJPY": (149.50, 0.60,   0.01,   0.9, "USD/JPY"),
+    "AUDUSD": (0.6550, 0.0040, 0.0001, 1.3, "AUD/USD"),
+    "USDCAD": (1.3600, 0.0045, 0.0001, 1.5, "USD/CAD"),
+    "USDCHF": (0.8950, 0.0035, 0.0001, 1.4, "USD/CHF"),
+    "NZDUSD": (0.6080, 0.0038, 0.0001, 1.6, "NZD/USD"),
+    "EURGBP": (0.8550, 0.0030, 0.0001, 1.8, "EUR/GBP"),
+    "EURJPY": (162.20, 0.75,   0.01,   1.1, "EUR/JPY"),
+    "GBPJPY": (190.50, 1.20,   0.01,   1.3, "GBP/JPY"),
+    "XAUUSD": (2320.0, 8.0,    0.1,    3.0, "XAU/USD"),
+    "BTCUSD": (68000.0,1500.0, 1.0,   25.0, "BTC/USD"),
+}
+
+TF_MAP = {
+    "M15": ("15min",  15),
+    "M30": ("30min",  30),
+    "H1":  ("1h",     60),
+    "H4":  ("4h",    240),
+    "D1":  ("1day", 1440),
+    "W1":  ("1week",10080),
+}
+
+def fetch_live_ohlcv(pair: str, timeframe: str, outputsize: int = 150) -> Optional[pd.DataFrame]:
+    """Fetch real OHLCV data from Twelve Data API"""
+    try:
+        tf_api, _ = TF_MAP.get(timeframe, ("1h", 60))
+        symbol = PAIR_CONFIG[pair][4].replace("/", "")  # EURUSD format
+        
+        key_param = f"&apikey={TWELVE_DATA_KEY}" if TWELVE_DATA_KEY else "&apikey=demo"
+        url = (f"https://api.twelvedata.com/time_series?"
+               f"symbol={PAIR_CONFIG[pair][4]}&interval={tf_api}"
+               f"&outputsize={outputsize}&format=JSON{key_param}")
+        
+        req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        
+        if "values" not in data or not data["values"]:
+            return None
+            
+        rows = data["values"]
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close","datetime":"time"})
+        for col in ["open","high","low","close"]:
+            df[col] = df[col].astype(float)
+        df = df.sort_values("time").reset_index(drop=True)
+        df.index = pd.to_datetime(df["time"])
+        return df[["open","high","low","close"]]
+    except Exception as e:
+        return None
+
+def synthetic_ohlcv(pair: str, timeframe: str, n: int = 300, seed: int = None) -> pd.DataFrame:
+    """High-quality synthetic OHLCV via GBM + mean reversion + cycles"""
+    base, daily_vol, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+    mins = TF_MAP.get(timeframe, ("", 60))[1]
+    tf_vol = daily_vol * math.sqrt(mins / 1440)
+    
+    s = seed or (int(hashlib.md5(f"{pair}{timeframe}".encode()).hexdigest(), 16) % 2**31)
+    rng = np.random.default_rng(s)
+    
+    closes = [base]
+    trend = rng.uniform(-0.00015, 0.00015)
+    cycle_len = max(20, n // 6)
+    
+    for i in range(1, n):
+        cyc = 0.35 * tf_vol * math.sin(2 * math.pi * i / cycle_len)
+        rev = -0.04 * (closes[-1] - base) / base
+        shock = rng.normal(0, tf_vol)
+        ret = trend + cyc / closes[-1] + rev + shock / closes[-1]
+        closes.append(closes[-1] * (1 + ret))
+    
+    closes = np.array(closes)
+    opens  = np.roll(closes, 1); opens[0] = closes[0]
+    highs  = np.maximum(opens, closes) + np.abs(rng.normal(0, tf_vol * 0.5, n))
+    lows   = np.minimum(opens, closes) - np.abs(rng.normal(0, tf_vol * 0.5, n))
+    
+    now = datetime.now().replace(second=0, microsecond=0)
+    times = [now - timedelta(minutes=mins * (n - i)) for i in range(n)]
+    
+    df = pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes}, index=times)
+    return df
+
+def get_ohlcv(pair: str, timeframe: str, n: int = 200) -> pd.DataFrame:
+    """Get OHLCV — tries live first, falls back to synthetic"""
+    if timeframe in ("H1", "H4", "D1"):  # Live data available for these
+        live = fetch_live_ohlcv(pair, timeframe, min(n, 500))
+        if live is not None and len(live) >= 50:
+            return live.tail(n)
+    return synthetic_ohlcv(pair, timeframe, n + 50,
+                           seed=int(datetime.now().strftime("%Y%m%d%H")))
+
+# ── Technical Indicators ──────────────────────────────────────────────────────
+def ema(s, p): return s.ewm(span=p, adjust=False).mean()
+def sma(s, p): return s.rolling(p).mean()
+
+def compute_rsi(s, p=14):
+    d = s.diff(); g = d.clip(lower=0).rolling(p).mean(); l = (-d.clip(upper=0)).rolling(p).mean()
+    return 100 - (100 / (1 + g / l.replace(0, np.nan)))
+
+def compute_macd(s):
+    m = ema(s, 12) - ema(s, 26); sig = ema(m, 9)
+    return m, sig, m - sig
+
+def compute_bb(s, p=20, k=2):
+    mid = sma(s, p); std = s.rolling(p).std()
+    return mid + k*std, mid, mid - k*std
+
+def compute_atr(h, l, c, p=14):
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=p, adjust=False).mean()
+
+def compute_stoch(h, l, c, kp=14, dp=3):
+    ll = l.rolling(kp).min(); hh = h.rolling(kp).max()
+    k = 100*(c-ll)/(hh-ll+1e-10)
+    return k, k.rolling(dp).mean()
+
+def compute_cci(h, l, c, p=20):
+    tp = (h+l+c)/3; ma = sma(tp, p)
+    md = tp.rolling(p).apply(lambda x: np.mean(np.abs(x - x.mean())))
+    return (tp - ma) / (0.015 * md + 1e-10)
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    c, h, l = df["close"], df["high"], df["low"]
+    df["ema20"]  = ema(c, 20)
+    df["ema50"]  = ema(c, 50)
+    df["ema200"] = ema(c, 200)
+    df["rsi"]    = compute_rsi(c)
+    df["macd"], df["macd_s"], df["macd_h"] = compute_macd(c)
+    df["bb_up"], df["bb_mid"], df["bb_low"] = compute_bb(c)
+    df["atr"]    = compute_atr(h, l, c)
+    df["stoch_k"], df["stoch_d"] = compute_stoch(h, l, c)
+    df["cci"]    = compute_cci(h, l, c)
+    return df.dropna()
+
+# ── Pattern Detection ─────────────────────────────────────────────────────────
+def detect_candle(row, prev) -> str:
+    o,h,l,c = row["open"],row["high"],row["low"],row["close"]
+    _,ph,pl,pc = prev["open"],prev["high"],prev["low"],prev["close"]
+    body = abs(c-o)+1e-10; rng = h-l+1e-10
+    lw = min(o,c)-l; uw = h-max(o,c)
+    if lw>=2*body and uw<body and c>o:     return "Hammer"
+    if uw>=2*body and lw<body and c<o:     return "Shooting Star"
+    if body/rng>0.85 and c>o:             return "Bullish Marubozu"
+    if body/rng>0.85 and c<o:             return "Bearish Marubozu"
+    if body/rng<0.08:                      return "Doji"
+    if c>o and c>ph and o<pc:             return "Bullish Engulfing"
+    if c<o and c<pl and o>pc:             return "Bearish Engulfing"
+    if lw>=2*body:                         return "Pin Bar (Bull)"
+    if uw>=2*body:                         return "Pin Bar (Bear)"
+    return "Standard"
+
+def detect_chart_pattern(df) -> str:
+    if len(df) < 20: return "N/A"
+    recent = df.tail(20); c=recent["close"].values; h=recent["high"].values; l=recent["low"].values
+    peaks   = [i for i in range(1,len(h)-1) if h[i]>h[i-1] and h[i]>h[i+1]]
+    troughs = [i for i in range(1,len(l)-1) if l[i]<l[i-1] and l[i]<l[i+1]]
+    if len(peaks)>=2 and abs(h[peaks[-1]]-h[peaks[-2]])/h[peaks[-2]]<0.006: return "Double Top"
+    if len(troughs)>=2 and abs(l[troughs[-1]]-l[troughs[-2]])/l[troughs[-2]]<0.006: return "Double Bottom"
+    slope = np.polyfit(range(len(c)), c, 1)[0]
+    std_r = np.std(c[-8:])/np.std(c) if np.std(c) else 1
+    if std_r<0.35 and slope>0: return "Bull Flag"
+    if std_r<0.35 and slope<0: return "Bear Flag"
+    if slope>0 and c[-1]>c[-5]: return "Ascending Channel"
+    if slope<0 and c[-1]<c[-5]: return "Descending Channel"
+    return "No Clear Pattern"
+
+# ── Signal Builder ────────────────────────────────────────────────────────────
+def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int = None) -> dict:
+    row  = df.iloc[-1]; prev = df.iloc[-2]
+    price = float(row["close"]); atr = float(row["atr"])
+    _, _, pip, spread, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+
+    votes_buy = sum([
+        row["ema20"] > row["ema50"], row["close"] > row["ema200"],
+        row["rsi"] < 50, row["macd_h"] > 0,
+        row["stoch_k"] < 50, row["close"] < row["bb_mid"],
+    ])
+    direction = "BUY" if votes_buy >= 3 else "SELL"
+
+    score = 50; reasons = []
+    checks = {
+        "BUY": [
+            (row["ema20"]>row["ema50"],    8, "EMA20 > EMA50 (uptrend)"),
+            (row["close"]>row["ema200"],   7, "Price above EMA200"),
+            (row["rsi"]<35,                9, f"RSI oversold ({row['rsi']:.1f})"),
+            (row["rsi"]<60,                4, f"RSI bullish ({row['rsi']:.1f})"),
+            (row["macd_h"]>0,              6, "MACD histogram positive"),
+            (row["stoch_k"]<25,            7, f"Stoch oversold ({row['stoch_k']:.1f})"),
+            (row["close"]<=row["bb_low"],  8, "Price at lower Bollinger Band"),
+            (row["cci"]<-100,              5, "CCI oversold"),
+            (row["macd"]>row["macd_s"],    6, "MACD bullish crossover"),
+        ],
+        "SELL": [
+            (row["ema20"]<row["ema50"],    8, "EMA20 < EMA50 (downtrend)"),
+            (row["close"]<row["ema200"],   7, "Price below EMA200"),
+            (row["rsi"]>65,                9, f"RSI overbought ({row['rsi']:.1f})"),
+            (row["rsi"]>40,                4, f"RSI bearish ({row['rsi']:.1f})"),
+            (row["macd_h"]<0,              6, "MACD histogram negative"),
+            (row["stoch_k"]>75,            7, f"Stoch overbought ({row['stoch_k']:.1f})"),
+            (row["close"]>=row["bb_up"],   8, "Price at upper Bollinger Band"),
+            (row["cci"]>100,               5, "CCI overbought"),
+            (row["macd"]<row["macd_s"],    6, "MACD bearish crossover"),
+        ]
+    }
+    for cond, pts, reason in checks[direction]:
+        if cond: score += pts; reasons.append(reason)
+    score = min(100, max(0, score))
+
+    mults = {"M15":(1.0,2.0),"M30":(1.2,2.5),"H1":(1.5,3.0),"H4":(1.8,3.5),"D1":(2.0,4.0),"W1":(2.5,5.0)}
+    sl_m, tp_m = mults.get(timeframe, (1.5, 3.0))
+    sl = price - atr*sl_m if direction=="BUY" else price + atr*sl_m
+    tp = price + atr*tp_m if direction=="BUY" else price - atr*tp_m
+    sl_pips = abs(price-sl)/pip; tp_pips = abs(tp-price)/pip
+    rr = round(tp_pips/sl_pips, 2) if sl_pips else 0
+
+    strength = "STRONG" if score>=80 else "MODERATE" if score>=65 else "WEAK" if score>=50 else "AVOID"
+    exp_h = {"M15":1,"M30":2,"H1":4,"H4":16,"D1":48,"W1":168}.get(timeframe, 4)
+    sessions = {"M15":"08:00-10:00 GMT","M30":"08:00-11:00 GMT","H1":"08:00-12:00 GMT",
+                "H4":"07:00-09:00 or 13:00-15:00 GMT","D1":"00:00 GMT Daily","W1":"Mon 00:00 GMT"}
+
+    ai = (f"Confluences ({len(reasons)}): {'; '.join(reasons[:4])}. "
+          f"Pattern: {detect_candle(row,prev)}. "
+          f"AI Score: {score}/100. "
+          f"{'High-conviction setup — manage with trailing stop.' if score>=75 else 'Moderate setup — use strict SL discipline.'}")
+
+    return {
+        "provider_id":   provider_id,
+        "pair":          pair,
+        "timeframe":     timeframe,
+        "direction":     direction,
+        "strength":      strength,
+        "confidence":    score,
+        "entry_price":   round(price, 5),
+        "stop_loss":     round(sl, 5),
+        "take_profit":   round(tp, 5),
+        "sl_pips":       round(sl_pips, 1),
+        "tp_pips":       round(tp_pips, 1),
+        "risk_reward":   rr,
+        "atr":           round(atr, 5),
+        "rsi":           round(float(row["rsi"]), 2),
+        "macd":          round(float(row["macd"]), 6),
+        "ema20":         round(float(row["ema20"]), 5),
+        "ema50":         round(float(row["ema50"]), 5),
+        "bb_upper":      round(float(row["bb_up"]), 5),
+        "bb_lower":      round(float(row["bb_low"]), 5),
+        "stoch_k":       round(float(row["stoch_k"]), 2),
+        "candle_pattern":detect_candle(row, prev),
+        "chart_pattern": detect_chart_pattern(df),
+        "entry_time":    sessions.get(timeframe, "London/NY Session"),
+        "ai_analysis":   ai,
+        "expires_at":    (datetime.now() + timedelta(hours=exp_h)).isoformat(),
+        "status":        "active",
+        "ohlcv": {
+            "time":   [str(t)[:16] for t in df.index[-80:]],
+            "open":   [round(float(v),5) for v in df["open"].tail(80)],
+            "high":   [round(float(v),5) for v in df["high"].tail(80)],
+            "low":    [round(float(v),5) for v in df["low"].tail(80)],
+            "close":  [round(float(v),5) for v in df["close"].tail(80)],
+            "ema20":  [round(float(v),5) for v in df["ema20"].tail(80)],
+            "ema50":  [round(float(v),5) for v in df["ema50"].tail(80)],
+            "bb_up":  [round(float(v),5) for v in df["bb_up"].tail(80)],
+            "bb_low": [round(float(v),5) for v in df["bb_low"].tail(80)],
+            "rsi":    [round(float(v),2) for v in df["rsi"].tail(80)],
+            "macd_h": [round(float(v),6) for v in df["macd_h"].tail(80)],
+        }
+    }
+
+def get_live_quote(pair: str) -> dict:
+    """Get single live price quote"""
+    try:
+        url = f"https://api.twelvedata.com/price?symbol={PAIR_CONFIG[pair][4]}&apikey=demo"
+        req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if "price" in data:
+            return {"pair": pair, "price": float(data["price"]), "source": "live"}
+    except: pass
+    
+    # Fallback
+    base, vol, pip, spread, _ = PAIR_CONFIG[pair]
+    import random
+    rng = np.random.default_rng(int(datetime.now().strftime("%Y%m%d%H%M")) // 2 + abs(hash(pair)) % 9999)
+    price = base * (1 + rng.normal(0, vol/base*0.25))
+    chg   = rng.normal(0, vol*0.1)
+    return {
+        "pair": pair, "price": round(price, 5),
+        "bid":  round(price - spread*pip/2, 5),
+        "ask":  round(price + spread*pip/2, 5),
+        "change": round(chg, 5), "change_pct": round(chg/base*100, 4),
+        "high": round(price + abs(rng.normal(0,vol*0.4)),5),
+        "low":  round(price - abs(rng.normal(0,vol*0.4)),5),
+        "spread": spread, "direction": "up" if chg>=0 else "down",
+        "source": "simulated", "timestamp": datetime.now().isoformat()
+    }
