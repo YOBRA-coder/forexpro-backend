@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+pandas
+numpy
+aiohttp
+python-telegram-bot

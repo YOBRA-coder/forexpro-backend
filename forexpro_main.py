@@ -3,8 +3,6 @@ ForexPro API — Complete Backend
 Routes: /auth, /signals, /copy, /providers, /education, /journal, /prices, /ws
 DB: SQLite (forexpro.db)
 """
-
-import pandas as pd
 from fastapi import FastAPI, Query, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
