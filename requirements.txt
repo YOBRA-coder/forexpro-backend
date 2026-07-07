@@ -1,8 +1,7 @@
-fastapi
-uvicorn
-pydantic
-pandas
-numpy
-aiohttp
-python-telegram-bot
-stripe
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pandas>=2.2
+numpy>=1.26
+stripe>=10.0
+python-dotenv>=1.0

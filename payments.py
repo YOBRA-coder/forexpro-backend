@@ -3,6 +3,7 @@ ForexPro Stripe Payment Integration
 ─────────────────────────────────────
 Handles provider subscription payments via Stripe.
 
+
 Plans:
   FREE     — 0 providers, limited signals
   PRO      — up to 3 providers, $9.99/mo
@@ -33,6 +34,7 @@ ENVIRONMENT VARIABLES:
 
 import os
 import stripe
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Request, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -55,20 +57,26 @@ PRICES = {
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
+REGISTRATION_FEE_USD = float(os.getenv("REGISTRATION_FEE_USD", "2.00"))
+
 # ── Request models ────────────────────────────────────────────────────────────
 class CheckoutReq(BaseModel):
     plan:       str  # trader_pro | trader_elite | provider_basic | provider_pro
     user_id:    int
     user_email: str
 
+class RegistrationCheckoutReq(BaseModel):
+    user_id:    int
+    user_email: str
+
 class PortalReq(BaseModel):
     customer_id: str
 
-# ── Create Stripe checkout session ────────────────────────────────────────────
+# ── Create Stripe checkout session (monthly subscription) ─────────────────────
 @router.post("/checkout")
 async def create_checkout(req: CheckoutReq):
     """
-    Creates a Stripe Checkout session for subscription purchase.
+    Creates a Stripe Checkout session for a MONTHLY subscription purchase.
     Returns: {checkout_url: str} — redirect user here to pay.
     """
     price_id = PRICES.get(req.plan)
@@ -86,12 +94,51 @@ async def create_checkout(req: CheckoutReq):
             metadata={
                 "user_id":  str(req.user_id),
                 "plan":     req.plan,
+                "kind":     "subscription",
                 "platform": "forexpro",
             },
             subscription_data={
-                "metadata": {"user_id": str(req.user_id), "plan": req.plan}
+                "metadata": {"user_id": str(req.user_id), "plan": req.plan, "kind": "subscription"}
             },
         )
+        with get_db() as db:
+            db.execute("""INSERT INTO payments (user_id,provider,kind,plan,amount,currency,
+                           status,stripe_session_id) VALUES (?,?,?,?,?,?,?,?)""",
+                       (req.user_id, "stripe", "subscription", req.plan, 0, "usd",
+                        "pending", session.id))
+        return {"checkout_url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e))
+
+# ── Create Stripe checkout session (one-time registration fee) ────────────────
+@router.post("/checkout/registration")
+async def create_registration_checkout(req: RegistrationCheckoutReq):
+    """
+    Creates a ONE-TIME Stripe payment session for the platform's registration/access fee.
+    This is a single mode="payment" charge — not a subscription.
+    """
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": "ForexPro — One-Time Registration Fee"},
+                    "unit_amount": int(REGISTRATION_FEE_USD * 100),
+                },
+                "quantity": 1,
+            }],
+            customer_email=req.user_email,
+            success_url=f"{FRONTEND_URL}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}/payment/cancelled",
+            metadata={"user_id": str(req.user_id), "kind": "registration", "platform": "forexpro"},
+        )
+        with get_db() as db:
+            db.execute("""INSERT INTO payments (user_id,provider,kind,amount,currency,
+                           status,stripe_session_id) VALUES (?,?,?,?,?,?,?)""",
+                       (req.user_id, "stripe", "registration", REGISTRATION_FEE_USD, "usd",
+                        "pending", session.id))
         return {"checkout_url": session.url, "session_id": session.id}
     except stripe.error.StripeError as e:
         raise HTTPException(400, str(e))
@@ -149,29 +196,48 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
 
 # ── Webhook event handlers ────────────────────────────────────────────────────
 async def _on_checkout_complete(session: dict):
-    """User completed checkout — upgrade their plan in DB."""
+    """User completed checkout — upgrade their plan (or mark registration paid) in DB."""
     user_id     = session.get("metadata", {}).get("user_id")
+    kind        = session.get("metadata", {}).get("kind", "subscription")
     plan        = session.get("metadata", {}).get("plan", "")
     customer_id = session.get("customer")
     sub_id      = session.get("subscription")
+    session_id  = session.get("id")
 
     if not user_id:
         print("Webhook: No user_id in metadata")
         return
 
-    # Map plan name to DB plan
-    db_plan = "pro" if "pro" in plan else "elite" if "elite" in plan else "free"
-    db_role = "provider" if "provider" in plan else None
-
     with get_db() as db:
         db.execute(
-            "UPDATE users SET plan=?, stripe_customer_id=?, stripe_sub_id=? WHERE id=?",
-            (db_plan, customer_id, sub_id, int(user_id))
+            "UPDATE payments SET status='success', updated_at=datetime('now') WHERE stripe_session_id=?",
+            (session_id,)
+        )
+
+        if kind == "registration":
+            db.execute("UPDATE users SET registration_paid=1, stripe_customer_id=? WHERE id=?",
+                       (customer_id, int(user_id)))
+            db.execute(
+                "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
+                (int(user_id), "system", "Registration Complete ✅",
+                 "Your one-time registration fee has been received. Welcome to ForexPro!")
+            )
+            print(f"Webhook: User {user_id} completed registration payment")
+            return
+
+        # Map plan name to DB plan
+        db_plan = "elite" if "elite" in plan else "pro"
+        db_role = "provider" if "provider" in plan else None
+        expires = (datetime.utcnow() + timedelta(days=30)).isoformat()
+
+        db.execute(
+            "UPDATE users SET plan=?, stripe_customer_id=?, stripe_sub_id=?, "
+            "subscription_status='active', subscription_expires_at=? WHERE id=?",
+            (db_plan, customer_id, sub_id, expires, int(user_id))
         )
         if db_role:
             db.execute("UPDATE users SET role=? WHERE id=?", (db_role, int(user_id)))
 
-        # Create notification
         db.execute(
             "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
             (int(user_id), "system", "Payment Successful",
@@ -189,6 +255,11 @@ async def _on_payment_succeeded(invoice: dict):
     with get_db() as db:
         user = db.execute("SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)).fetchone()
         if user:
+            expires = (datetime.utcnow() + timedelta(days=30)).isoformat()
+            db.execute(
+                "UPDATE users SET subscription_status='active', subscription_expires_at=? WHERE id=?",
+                (expires, user["id"])
+            )
             db.execute(
                 "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
                 (user["id"], "system", "Payment Received",
@@ -203,6 +274,7 @@ async def _on_payment_failed(invoice: dict):
     with get_db() as db:
         user = db.execute("SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)).fetchone()
         if user:
+            db.execute("UPDATE users SET subscription_status='past_due' WHERE id=?", (user["id"],))
             db.execute(
                 "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
                 (user["id"], "system", "Payment Failed ⚠️",
@@ -215,7 +287,10 @@ async def _on_subscription_cancelled(sub: dict):
     with get_db() as db:
         user = db.execute("SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)).fetchone()
         if user:
-            db.execute("UPDATE users SET plan='free', stripe_sub_id=NULL WHERE id=?", (user["id"],))
+            db.execute(
+                "UPDATE users SET plan='free', stripe_sub_id=NULL, subscription_status='cancelled' WHERE id=?",
+                (user["id"],)
+            )
             db.execute(
                 "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
                 (user["id"], "system", "Subscription Cancelled",
@@ -258,23 +333,27 @@ async def get_subscription(user_id: int):
             return {"plan": user["plan"], "status": "unknown"}
 
 # ── Plans info endpoint ───────────────────────────────────────────────────────
+from mpesa import SUBSCRIPTION_PRICES_KES, REGISTRATION_FEE_KES
+
 @router.get("/plans")
 async def get_plans():
-    """Return available plans and pricing."""
+    """Return available plans and pricing in both USD (card/Stripe) and KES (M-Pesa)."""
     return {
         "publishable_key": PK_KEY,
+        "registration_fee": {"usd": REGISTRATION_FEE_USD, "kes": REGISTRATION_FEE_KES,
+                              "note": "One-time fee charged once per account before full access."},
         "plans": [
             {
                 "id":       "free",
                 "name":     "Free",
-                "price":    0,
+                "price_usd": 0, "price_kes": 0,
                 "features": ["5 signals/day", "1 provider copy", "Basic education"],
                 "cta":      "Get Started",
             },
             {
                 "id":       "trader_pro",
                 "name":     "Pro Trader",
-                "price":    9.99,
+                "price_usd": 9.99, "price_kes": SUBSCRIPTION_PRICES_KES["trader_pro"],
                 "per":      "month",
                 "price_id": PRICES["trader_pro"],
                 "features": ["Unlimited signals", "3 provider copies", "All education courses", "Email alerts"],
@@ -284,7 +363,7 @@ async def get_plans():
             {
                 "id":       "trader_elite",
                 "name":     "Elite Trader",
-                "price":    29.99,
+                "price_usd": 29.99, "price_kes": SUBSCRIPTION_PRICES_KES["trader_elite"],
                 "per":      "month",
                 "price_id": PRICES["trader_elite"],
                 "features": ["Unlimited everything", "Priority support", "Telegram alerts", "Backtesting engine"],
@@ -293,7 +372,7 @@ async def get_plans():
             {
                 "id":       "provider_pro",
                 "name":     "Signal Provider",
-                "price":    29.99,
+                "price_usd": 29.99, "price_kes": SUBSCRIPTION_PRICES_KES["provider_pro"],
                 "per":      "month",
                 "price_id": PRICES["provider_pro"],
                 "features": ["Verified badge", "Unlimited followers", "Analytics dashboard", "Revenue sharing"],

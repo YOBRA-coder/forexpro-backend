@@ -241,6 +241,10 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
           f"AI Score: {score}/100. "
           f"{'High-conviction setup — manage with trailing stop.' if score>=75 else 'Moderate setup — use strict SL discipline.'}")
 
+    sr_levels = detect_support_resistance(df)
+    trendline = detect_trendline(df)
+    markers   = build_markers(df, direction)
+
     return {
         "provider_id":   provider_id,
         "pair":          pair,
@@ -254,6 +258,9 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
         "sl_pips":       round(sl_pips, 1),
         "tp_pips":       round(tp_pips, 1),
         "risk_reward":   rr,
+        "support_resistance": sr_levels,
+        "trendline":     trendline,
+        "markers":       markers,
         "atr":           round(atr, 5),
         "rsi":           round(float(row["rsi"]), 2),
         "macd":          round(float(row["macd"]), 6),
@@ -282,6 +289,96 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
             "macd_h": [round(float(v),6) for v in df["macd_h"].tail(80)],
         }
     }
+
+# ── Chart Annotation Engine (S/R, trendlines, markers) ────────────────────────
+def detect_support_resistance(df: pd.DataFrame, lookback: int = 120, n_levels: int = 4) -> list:
+    """Cluster recent swing highs/lows into horizontal support & resistance levels."""
+    if len(df) < 20:
+        return []
+    recent = df.tail(min(lookback, len(df)))
+    h, l = recent["high"].values, recent["low"].values
+    swing_highs = [h[i] for i in range(2, len(h) - 2)
+                   if h[i] == max(h[i-2:i+3])]
+    swing_lows  = [l[i] for i in range(2, len(l) - 2)
+                   if l[i] == min(l[i-2:i+3])]
+    price_range = float(recent["high"].max() - recent["low"].min()) or 1.0
+    tol = price_range * 0.006  # cluster tolerance
+
+    def cluster(points):
+        pts = sorted(points)
+        clusters = []
+        for p in pts:
+            if clusters and abs(p - clusters[-1]["avg"]) < tol:
+                c = clusters[-1]
+                c["vals"].append(p)
+                c["avg"] = sum(c["vals"]) / len(c["vals"])
+            else:
+                clusters.append({"vals": [p], "avg": p})
+        clusters.sort(key=lambda c: len(c["vals"]), reverse=True)
+        return [round(float(c["avg"]), 5) for c in clusters[:n_levels]]
+
+    last_price = float(recent["close"].iloc[-1])
+    res = [lvl for lvl in cluster(swing_highs) if lvl > last_price]
+    sup = [lvl for lvl in cluster(swing_lows) if lvl < last_price]
+    levels = ([{"price": p, "type": "resistance"} for p in sorted(res)[:n_levels]] +
+              [{"price": p, "type": "support"} for p in sorted(sup, reverse=True)[:n_levels]])
+    return levels
+
+def detect_trendline(df: pd.DataFrame, lookback: int = 40) -> Optional[dict]:
+    """Fit a simple trendline through recent swing lows (uptrend) or swing highs (downtrend)."""
+    if len(df) < lookback:
+        return None
+    recent = df.tail(lookback)
+    c = recent["close"].values
+    slope = np.polyfit(range(len(c)), c, 1)[0]
+    use_lows = slope >= 0
+    series = recent["low"] if use_lows else recent["high"]
+    vals = series.values
+    if use_lows:
+        i1 = int(np.argmin(vals[:len(vals)//2] if len(vals) > 4 else vals))
+        i2 = len(vals) - 1
+    else:
+        i1 = int(np.argmax(vals[:len(vals)//2] if len(vals) > 4 else vals))
+        i2 = len(vals) - 1
+    t1, t2 = recent.index[i1], recent.index[i2]
+    v1, v2 = float(vals[i1]), float(vals[i2])
+    return {
+        "direction": "up" if use_lows else "down",
+        "p1": {"time": str(t1)[:16], "value": round(v1, 5)},
+        "p2": {"time": str(t2)[:16], "value": round(v2, 5)},
+    }
+
+def build_markers(df: pd.DataFrame, direction: str) -> list:
+    """Return lightweight-charts-style markers for the most recent notable candle pattern."""
+    if len(df) < 3:
+        return []
+    row, prev = df.iloc[-1], df.iloc[-2]
+    pattern = detect_candle(row, prev)
+    markers = []
+    if pattern != "Standard":
+        bullish = "Bull" in pattern or pattern in ("Hammer", "Bullish Marubozu", "Bullish Engulfing")
+        markers.append({
+            "time": str(df.index[-1])[:16],
+            "position": "belowBar" if bullish else "aboveBar",
+            "color": "#00E070" if bullish else "#FF3550",
+            "shape": "arrowUp" if bullish else "arrowDown",
+            "text": pattern,
+        })
+    markers.append({
+        "time": str(df.index[-1])[:16],
+        "position": "belowBar" if direction == "BUY" else "aboveBar",
+        "color": "#F0B429",
+        "shape": "arrowUp" if direction == "BUY" else "arrowDown",
+        "text": f"{direction} Signal",
+    })
+    return markers
+
+def pip_value_usd(pair: str, pnl_pips: float, lot_size: float) -> float:
+    """Rough standard-lot pip value approximation (~$10/pip on a 1.0 lot for
+    most USD-quoted pairs). Good enough for a simulated copy-trading ledger."""
+    _, _, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+    per_pip_standard = 10.0 if pair != "XAUUSD" and pair != "BTCUSD" else (100.0 if pair == "XAUUSD" else 1.0)
+    return round(pnl_pips * lot_size * per_pip_standard, 2)
 
 def get_live_quote(pair: str) -> dict:
     """Get single live price quote"""

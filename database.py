@@ -42,7 +42,32 @@ def init_db():
             avatar      TEXT    DEFAULT '',
             bio         TEXT    DEFAULT '',
             created_at  TEXT    DEFAULT (datetime('now')),
-            last_login  TEXT
+            last_login  TEXT,
+            registration_paid      INTEGER DEFAULT 0,
+            subscription_status    TEXT    DEFAULT 'inactive',  -- inactive|active|past_due|cancelled
+            subscription_expires_at TEXT,
+            stripe_customer_id     TEXT,
+            stripe_sub_id          TEXT,
+            mpesa_phone             TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id             INTEGER REFERENCES users(id),
+            provider            TEXT NOT NULL,   -- mpesa | stripe
+            kind                TEXT NOT NULL,   -- registration | subscription
+            plan                TEXT,
+            amount              REAL,
+            currency            TEXT DEFAULT 'KES',
+            status              TEXT DEFAULT 'pending', -- pending|success|failed|cancelled
+            checkout_request_id TEXT,
+            merchant_request_id TEXT,
+            mpesa_receipt       TEXT,
+            phone               TEXT,
+            stripe_session_id   TEXT,
+            raw_response        TEXT,
+            created_at          TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS signals (
@@ -77,7 +102,8 @@ def init_db():
             close_price     REAL,
             closed_at       TEXT,
             expires_at      TEXT,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT (datetime('now')),
+            chart_data      TEXT  -- JSON: {ohlcv, markers, support_resistance, trendline}
         );
 
         CREATE TABLE IF NOT EXISTS copy_trades (
@@ -179,9 +205,40 @@ def init_db():
         );
         """)
 
+        _migrate_users_table(db)
         # Seed demo users
         _seed_demo_data(db)
     print(f"[DB] SQLite initialized at {DB_PATH}")
+
+def _migrate_users_table(db):
+    """Add new columns to already-existing tables (idempotent, safe to re-run)."""
+    def add_cols(table, additions):
+        cols = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, decl in additions.items():
+            if col not in cols:
+                try:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                except Exception as e:
+                    print(f"[DB] migration warning ({table}.{col}): {e}")
+
+    add_cols("users", {
+        "registration_paid":       "INTEGER DEFAULT 0",
+        "subscription_status":     "TEXT DEFAULT 'inactive'",
+        "subscription_expires_at": "TEXT",
+        "stripe_customer_id":      "TEXT",
+        "stripe_sub_id":           "TEXT",
+        "mpesa_phone":             "TEXT",
+        "bridge_token":            "TEXT",
+        "bridge_connected_at":     "TEXT",
+    })
+    add_cols("signals", {"chart_data": "TEXT"})
+    add_cols("copy_trades", {
+        "execution_mode": "TEXT DEFAULT 'simulated'",  # simulated | mt5
+        "mt5_ticket":      "TEXT",
+        "fail_reason":     "TEXT",
+        "close_price":     "REAL",
+    })
+    add_cols("subscriptions", {"auto_execute": "INTEGER DEFAULT 0"})
 
 def _seed_demo_data(db):
     import hashlib
@@ -250,6 +307,70 @@ def _seed_demo_data(db):
                    (title, desc, cat, level, lessons))
 
     print("[DB] Demo data seeded")
+
+def is_subscription_active(user: dict) -> bool:
+    """True if the user's paid subscription is currently valid (free plan is always 'active')."""
+    if not user:
+        return False
+    if user.get("plan", "free") == "free":
+        return True
+    exp = user.get("subscription_expires_at")
+    if not exp:
+        return False
+    try:
+        return datetime.fromisoformat(exp) > datetime.now()
+    except Exception:
+        return False
+
+# Feature limits per plan. `None` means unlimited. Mirrors the marketing
+# copy on the /payments/plans pricing cards — keep both in sync.
+PLAN_LIMITS = {
+    "free":         {"signals_per_day": 5,    "max_subscriptions": 1,    "copies_per_day": 3,    "can_be_provider": False, "bulk_generate": False},
+    "trader_pro":   {"signals_per_day": None, "max_subscriptions": 3,    "copies_per_day": None, "can_be_provider": False, "bulk_generate": True},
+    "trader_elite": {"signals_per_day": None, "max_subscriptions": None, "copies_per_day": None, "can_be_provider": False, "bulk_generate": True},
+    "provider_pro": {"signals_per_day": None, "max_subscriptions": None, "copies_per_day": None, "can_be_provider": True,  "bulk_generate": True},
+}
+
+def plan_limits(plan: str) -> dict:
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+def effective_plan(user: dict) -> str:
+    """The plan to actually enforce limits against — falls back to 'free' if a
+    paid plan's subscription has lapsed, so an expired Pro account doesn't keep
+    unlimited access forever."""
+    plan = user.get("plan", "free") if user else "free"
+    if plan != "free" and not is_subscription_active(user):
+        return "free"
+    return plan
+
+def recompute_provider_stats(db, user_id: int):
+    """Recalculate a provider's public track record from their real signal history.
+    No-op if this user hasn't registered as a provider."""
+    row = db.execute("SELECT id FROM providers WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return
+    closed = db.execute(
+        "SELECT result, pnl_pips, risk_reward, closed_at FROM signals WHERE provider_id=? AND status='closed'",
+        (user_id,)).fetchall()
+    total_signals = db.execute("SELECT COUNT(*) c FROM signals WHERE provider_id=?", (user_id,)).fetchone()["c"]
+    wins = sum(1 for r in closed if r["result"] == "win")
+    win_rate = round(wins / len(closed) * 100, 1) if closed else 0.0
+    total_pips = round(sum(r["pnl_pips"] or 0 for r in closed), 1)
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    monthly_pips = round(sum(r["pnl_pips"] or 0 for r in closed if (r["closed_at"] or "") >= cutoff), 1)
+    rr_vals = [r["risk_reward"] for r in closed if r["risk_reward"]]
+    avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0
+    followers = db.execute(
+        "SELECT COUNT(*) c FROM subscriptions WHERE provider_id=? AND is_active=1", (user_id,)).fetchone()["c"]
+    db.execute("""UPDATE providers SET win_rate=?, total_signals=?, total_pips=?, monthly_pips=?,
+                  avg_rr=?, followers_count=? WHERE user_id=?""",
+               (win_rate, total_signals, total_pips, monthly_pips, avg_rr, followers, user_id))
+
+def generate_bridge_token() -> str:
+    """Random per-user token the MT5 EA uses to authenticate to /bridge/* endpoints
+    (kept separate from the normal JWT since an EA can't do an interactive login)."""
+    import secrets
+    return "fpx_" + secrets.token_hex(20)
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
