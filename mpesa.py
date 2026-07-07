@@ -50,7 +50,7 @@ SHORTCODE       = os.getenv("MPESA_SHORTCODE", "174379")
 PASSKEY         = os.getenv("MPESA_PASSKEY", "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919")
 CALLBACK_URL    = os.getenv("MPESA_CALLBACK_URL", "https://example.com/payments/mpesa/callback")
 
-REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "250"))
+REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "2"))
 SUBSCRIPTION_PRICES_KES = {
     "trader_pro":     1,
     "trader_elite":   2,
