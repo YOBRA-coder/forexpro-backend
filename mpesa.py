@@ -52,10 +52,10 @@ CALLBACK_URL    = os.getenv("MPESA_CALLBACK_URL", "https://example.com/payments/
 
 REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "250"))
 SUBSCRIPTION_PRICES_KES = {
-    "trader_pro":     1200,
-    "trader_elite":   3500,
-    "provider_basic": 1200,
-    "provider_pro":   3500,
+    "trader_pro":     1,
+    "trader_elite":   2,
+    "provider_basic": 3,
+    "provider_pro":   4,
 }
 
 router = APIRouter(prefix="/payments/mpesa", tags=["mpesa"])
