@@ -6,6 +6,10 @@ import pytest
 
 from pandas._libs.tslibs import OutOfBoundsTimedelta
 from pandas._libs.tslibs.dtypes import NpyDatetimeUnit
+from pandas.compat.numpy import (
+    is_numpy_dev,
+    np_version_gt2_5,
+)
 from pandas.errors import Pandas4Warning
 
 from pandas import (
@@ -530,7 +534,12 @@ def test_construction_out_of_bounds_td64ns(val, unit):
 
     # Timedelta.max is just under 106752 days
     td64 = np.timedelta64(val, unit)
-    assert td64.astype("m8[ns]").view("i8") < 0  # i.e. naive astype will be wrong
+    if is_numpy_dev or np_version_gt2_5:
+        # numpy now raises instead of silently overflowing
+        with pytest.raises(OverflowError, match="Overflow"):
+            td64.astype("m8[ns]")
+    else:
+        assert td64.astype("m8[ns]").view("i8") < 0  # i.e. naive astype will be wrong
 
     td = Timedelta(td64)
     if unit != "M":
@@ -543,10 +552,15 @@ def test_construction_out_of_bounds_td64ns(val, unit):
         td.as_unit("ns")
 
     # But just back in bounds and we are OK
-    assert Timedelta(td64 - 1) == td64 - 1
+    one = np.timedelta64(1, unit)
+    assert Timedelta(td64 - one) == td64 - one
 
-    td64 *= -1
-    assert td64.astype("m8[ns]").view("i8") > 0  # i.e. naive astype will be wrong
+    td64 = np.timedelta64(-val, unit)
+    if is_numpy_dev or np_version_gt2_5:
+        with pytest.raises(OverflowError, match="Overflow"):
+            td64.astype("m8[ns]")
+    else:
+        assert td64.astype("m8[ns]").view("i8") > 0  # i.e. naive astype will be wrong
 
     td2 = Timedelta(td64)
     msg = r"Cannot cast -1067\d\d days .* to unit='ns' without overflow"
@@ -554,7 +568,7 @@ def test_construction_out_of_bounds_td64ns(val, unit):
         td2.as_unit("ns")
 
     # But just back in bounds and we are OK
-    assert Timedelta(td64 + 1) == td64 + 1
+    assert Timedelta(td64 + one) == td64 + one
 
 
 @pytest.mark.parametrize(
@@ -572,7 +586,8 @@ def test_construction_out_of_bounds_td64s(val, unit):
         Timedelta(td64)
 
     # But just back in bounds and we are OK
-    assert Timedelta(td64 - 10**9) == td64 - 10**9
+    offset = np.timedelta64(10**9, unit)
+    assert Timedelta(td64 - offset) == td64 - offset
 
 
 @pytest.mark.parametrize(

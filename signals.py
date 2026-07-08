@@ -30,6 +30,8 @@ PAIR_CONFIG = {
 }
 
 TF_MAP = {
+    "M1":  ("1min",     1),
+    "M5":  ("5min",     5),
     "M15": ("15min",  15),
     "M30": ("30min",  30),
     "H1":  ("1h",     60),
@@ -379,6 +381,15 @@ def pip_value_usd(pair: str, pnl_pips: float, lot_size: float) -> float:
     _, _, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
     per_pip_standard = 10.0 if pair != "XAUUSD" and pair != "BTCUSD" else (100.0 if pair == "XAUUSD" else 1.0)
     return round(pnl_pips * lot_size * per_pip_standard, 2)
+
+def compute_margin_usd(pair: str, lot_size: float) -> float:
+    """Cash reserved from the user's balance while a position is open, at a
+    simplified ~1:100 leverage (matches the cent/nano-lot brokers recommended
+    to users on the Profile page). Not a real margin-call engine — just enough
+    so opening/closing a copy trade actually moves the paper balance instead
+    of balance sitting frozen at its signup value forever."""
+    per_lot = 3000.0 if pair == "XAUUSD" else (2000.0 if pair == "BTCUSD" else 1000.0)
+    return round(lot_size * per_lot, 2)
 
 def get_live_quote(pair: str) -> dict:
     """Get single live price quote"""

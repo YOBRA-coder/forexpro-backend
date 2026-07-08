@@ -1121,6 +1121,18 @@ class TestBusinessDateRange:
         with pytest.raises(OutOfBoundsDatetime, match=msg):
             date_range(start, periods=2, freq="B", unit="ns")
 
+    def test_bdate_range_end_weekend_periods(self):
+        # GH#64834
+        result = bdate_range(end="2026-03-21", periods=3)
+        expected = DatetimeIndex(["2026-03-18", "2026-03-19", "2026-03-20"])
+        tm.assert_index_equal(result, expected)
+
+    def test_bdate_range_end_sunday_periods(self):
+        # GH#64834
+        result = bdate_range(end="2026-03-22", periods=3)
+        expected = DatetimeIndex(["2026-03-18", "2026-03-19", "2026-03-20"])
+        tm.assert_index_equal(result, expected)
+
 
 class TestCustomDateRange:
     def test_constructor(self):
@@ -1390,7 +1402,7 @@ class TestDateRangeNonNano:
 
         exp = np.arange(
             start.astype("M8[s]").view("i8"),
-            (end + 1).astype("M8[s]").view("i8"),
+            (end + np.timedelta64(1, "D")).astype("M8[s]").view("i8"),
             24 * 3600,
         ).view("M8[s]")
 

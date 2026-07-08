@@ -21,7 +21,7 @@ except ImportError:
 from database import get_db, init_db, hash_password, verify_password, is_subscription_active, recompute_provider_stats, plan_limits, effective_plan
 from signals import (get_ohlcv, add_indicators, build_signal, get_live_quote,
                      PAIR_CONFIG, TF_MAP, detect_support_resistance,
-                     detect_trendline, build_markers, pip_value_usd)
+                     detect_trendline, build_markers, pip_value_usd, compute_margin_usd)
 from payments import router as payments_router
 from mpesa import router as mpesa_router
 from bridge import router as bridge_router
@@ -66,6 +66,15 @@ class JournalEntryReq(BaseModel):
 class UpdateProfileReq(BaseModel):
     bio: str = ""; broker: str = ""; mt5_login: str = ""; mt5_server: str = ""
 
+class SettingsReq(BaseModel):
+    email_alerts_enabled: Optional[bool] = None
+    default_lot_size: Optional[float] = None
+    default_risk_pct: Optional[float] = None
+
+class ChangePasswordReq(BaseModel):
+    current_password: str
+    new_password: str
+
 class ProviderRegisterReq(BaseModel):
     display_name: str; description: str = ""; monthly_fee: float = 0
 
@@ -75,6 +84,14 @@ class ProviderUpdateReq(BaseModel):
 
 class CopySignalReq(BaseModel):
     lot_size: float = 0.01; risk_pct: float = 2.0; execute_live: bool = False
+
+class QuickTradeReq(BaseModel):
+    pair: str
+    direction: str  # BUY | SELL
+    lot_size: float = 0.01
+    sl_pips: float = 30
+    tp_pips: float = 60
+    execute_live: bool = False
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -130,19 +147,47 @@ def login(req: LoginReq):
 @app.get("/auth/me")
 def get_me(user=Depends(get_current_user)):
     with get_db() as db:
+        equity = sync_equity(db, user["id"])
         notifs = db.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0",
                             (user["id"],)).fetchone()[0]
         subs = db.execute("SELECT COUNT(*) FROM subscriptions WHERE follower_id=? AND is_active=1",
                           (user["id"],)).fetchone()[0]
-        return {**{k:v for k,v in user.items() if k!="password"},
+        fresh = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        return {**{k:v for k,v in dict(fresh).items() if k!="password"},
+                "equity": equity,
                 "unread_notifications": notifs, "active_subscriptions": subs,
-                "subscription_active": is_subscription_active(dict(user))}
+                "subscription_active": is_subscription_active(dict(fresh))}
 
 @app.put("/auth/profile")
 def update_profile(req: UpdateProfileReq, user=Depends(get_current_user)):
     with get_db() as db:
         db.execute("UPDATE users SET bio=?,broker=?,mt5_login=?,mt5_server=? WHERE id=?",
                    (req.bio, req.broker, req.mt5_login, req.mt5_server, user["id"]))
+        fresh = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+    return {"success": True, "user": {k: v for k, v in dict(fresh).items() if k != "password"}}
+
+@app.put("/auth/settings")
+def update_settings(req: SettingsReq, user=Depends(get_current_user)):
+    with get_db() as db:
+        if req.email_alerts_enabled is not None:
+            db.execute("UPDATE users SET email_alerts_enabled=? WHERE id=?",
+                       (int(req.email_alerts_enabled), user["id"]))
+        if req.default_lot_size is not None:
+            db.execute("UPDATE users SET default_lot_size=? WHERE id=?", (req.default_lot_size, user["id"]))
+        if req.default_risk_pct is not None:
+            db.execute("UPDATE users SET default_risk_pct=? WHERE id=?", (req.default_risk_pct, user["id"]))
+        fresh = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+    return {"success": True, "user": {k: v for k, v in dict(fresh).items() if k != "password"}}
+
+@app.post("/auth/change-password")
+def change_password(req: ChangePasswordReq, user=Depends(get_current_user)):
+    with get_db() as db:
+        row = db.execute("SELECT password FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not verify_password(req.current_password, row["password"]):
+            raise HTTPException(400, "Current password is incorrect")
+        if len(req.new_password) < 8:
+            raise HTTPException(400, "New password must be at least 8 characters")
+        db.execute("UPDATE users SET password=? WHERE id=?", (hash_password(req.new_password), user["id"]))
     return {"success": True}
 
 # ── Signal Routes ─────────────────────────────────────────────────────────────
@@ -187,36 +232,66 @@ def generate_signal(req: GenerateSignalReq, user=Depends(get_current_user)):
               sig["ai_analysis"], sig["expires_at"], json.dumps(chart_data)))
         sig_id = cur.lastrowid
         
-        # Auto-distribute to subscribers if user is a provider
+        # Distribute to subscribers — auto_copy=1 opens immediately (reserving margin),
+        # auto_copy=0 creates a pending_approval row the follower must approve/decline
+        # on the Copy Trading page (previously: nothing happened at all for manual
+        # subscribers, which is why "manual" looked broken).
         subs = db.execute(
-            "SELECT * FROM subscriptions WHERE provider_id=? AND is_active=1 AND auto_copy=1",
+            "SELECT * FROM subscriptions WHERE provider_id=? AND is_active=1",
             (user["id"],)).fetchall()
         copies_created = 0
         for sub in subs:
-            if sig["confidence"] >= sub["min_confidence"]:
-                pf = json.loads(sub["pairs_filter"] or "[]")
-                if not pf or sig["pair"] in pf:
-                    live = False
-                    if sub["auto_execute"]:
-                        follower = db.execute("SELECT bridge_token FROM users WHERE id=?",
-                                               (sub["follower_id"],)).fetchone()
-                        live = bool(follower and follower["bridge_token"])
-                    exec_mode = "mt5" if live else "simulated"
-                    status0   = "pending_bridge" if live else "open"
-                    db.execute("""INSERT INTO copy_trades
-                        (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
-                         stop_loss,take_profit,status,execution_mode,opened_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
-                        (sub["follower_id"], user["id"], sig_id,
-                         sub["max_lot"], sub["risk_pct"],
-                         sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode))
-                    copies_created += 1
-                    # Notification
-                    db.execute("""INSERT INTO notifications (user_id,type,title,message)
-                        VALUES (?,?,?,?)""",
-                        (sub["follower_id"], "signal",
-                         f"New Signal: {sig['pair']} {sig['direction']}",
-                         f"Confidence: {sig['confidence']}% | Entry: {sig['entry_price']} | SL: {sig['stop_loss']} | TP: {sig['take_profit']}"))
+            if sig["confidence"] < sub["min_confidence"]:
+                continue
+            pf = json.loads(sub["pairs_filter"] or "[]")
+            if pf and sig["pair"] not in pf:
+                continue
+
+            if not sub["auto_copy"]:
+                # Manual mode: suggest it, don't spend the follower's balance yet.
+                db.execute("""INSERT INTO copy_trades
+                    (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
+                     stop_loss,take_profit,status,execution_mode)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (sub["follower_id"], user["id"], sig_id, sub["max_lot"], sub["risk_pct"],
+                     sig["entry_price"], sig["stop_loss"], sig["take_profit"], "pending_approval", "simulated"))
+                db.execute("""INSERT INTO notifications (user_id,type,title,message)
+                    VALUES (?,?,?,?)""",
+                    (sub["follower_id"], "signal",
+                     f"Review to copy: {sig['pair']} {sig['direction']}",
+                     f"{sig['confidence']}% confidence — open Copy Trading to approve or decline."))
+                copies_created += 1
+                continue
+
+            live = False
+            if sub["auto_execute"]:
+                follower = db.execute("SELECT bridge_token FROM users WHERE id=?",
+                                       (sub["follower_id"],)).fetchone()
+                live = bool(follower and follower["bridge_token"])
+            exec_mode = "mt5" if live else "simulated"
+            status0   = "pending_bridge" if live else "open"
+            margin = compute_margin_usd(sig["pair"], sub["max_lot"])
+            follower_bal = db.execute("SELECT balance FROM users WHERE id=?", (sub["follower_id"],)).fetchone()["balance"]
+            if follower_bal < margin:
+                db.execute("""INSERT INTO notifications (user_id,type,title,message)
+                    VALUES (?,?,?,?)""",
+                    (sub["follower_id"], "signal", f"Skipped {sig['pair']} — low balance",
+                     f"Needed ${margin:.2f} margin but balance is ${follower_bal:.2f}."))
+                continue
+            db.execute("""INSERT INTO copy_trades
+                (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
+                 stop_loss,take_profit,status,execution_mode,opened_at,margin_used)
+                VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?)""",
+                (sub["follower_id"], user["id"], sig_id,
+                 sub["max_lot"], sub["risk_pct"],
+                 sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode, margin))
+            db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, sub["follower_id"]))
+            copies_created += 1
+            db.execute("""INSERT INTO notifications (user_id,type,title,message)
+                VALUES (?,?,?,?)""",
+                (sub["follower_id"], "signal",
+                 f"Auto-copied: {sig['pair']} {sig['direction']}",
+                 f"Confidence: {sig['confidence']}% | Entry: {sig['entry_price']} | SL: {sig['stop_loss']} | TP: {sig['take_profit']}"))
         
         sig["id"] = sig_id
         sig["copies_distributed"] = copies_created
@@ -251,6 +326,34 @@ def bulk_signals(req: BulkSignalReq, user=Depends(get_current_user)):
             broadcast_threadsafe("signals", {"type": "new_signal", "data": sig})
     return {"count": len(results), "signals": results}
 
+def sync_equity(db, user_id: int) -> float:
+    """balance + unrealized P&L of every currently-open copy trade, using a fresh
+    quote per unique pair. Persists to users.equity so any page reading the cached
+    user object still sees a reasonably fresh number."""
+    row = db.execute("SELECT balance FROM users WHERE id=?", (user_id,)).fetchone()
+    balance = float(row["balance"]) if row else 0.0
+    open_trades = db.execute(
+        "SELECT ct.*, COALESCE(ct.pair, s.pair) as pair, COALESCE(ct.direction, s.direction) as direction "
+        "FROM copy_trades ct LEFT JOIN signals s ON ct.signal_id=s.id "
+        "WHERE ct.follower_id=? AND ct.status='open'", (user_id,)).fetchall()
+    floating = 0.0
+    quote_cache = {}
+    for t in open_trades:
+        pair = t["pair"]
+        if not pair: continue
+        if pair not in quote_cache:
+            try: quote_cache[pair] = float(get_live_quote(pair)["price"])
+            except Exception: quote_cache[pair] = None
+        price = quote_cache[pair]
+        if price is None: continue
+        _, _, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+        is_buy = t["direction"] == "BUY"
+        pnl_pips = (price - t["entry_price"]) / pip * (1 if is_buy else -1)
+        floating += pip_value_usd(pair, pnl_pips, t["lot_size"])
+    equity = round(balance + floating, 2)
+    db.execute("UPDATE users SET equity=? WHERE id=?", (equity, user_id))
+    return equity
+
 def _expand_signal(row: dict) -> dict:
     d = dict(row)
     raw = d.pop("chart_data", None)
@@ -273,17 +376,6 @@ def latest_signals(limit: int = Query(20), user=Depends(get_optional_user)):
         """, (limit,)).fetchall()
         return {"signals": [_expand_signal(r) for r in rows]}
 
-@app.get("/signals/{signal_id}")
-def get_signal(signal_id: int, user=Depends(get_optional_user)):
-    with get_db() as db:
-        row = db.execute("""
-            SELECT s.*, u.username as provider_name
-            FROM signals s LEFT JOIN users u ON s.provider_id=u.id
-            WHERE s.id=?
-        """, (signal_id,)).fetchone()
-        if not row: raise HTTPException(404, "Signal not found")
-        return _expand_signal(row)
-
 @app.get("/signals/history")
 def signal_history(pair: str = "EURUSD", timeframe: str = "H1", period: str = "1M",
                    user=Depends(get_optional_user)):
@@ -303,6 +395,21 @@ def signal_history(pair: str = "EURUSD", timeframe: str = "H1", period: str = "1
     return {"pair": pair, "timeframe": timeframe, "period": period,
             "count": len(signals), "estimated_winrate": round(wins/max(len(signals),1)*100,1),
             "signals": signals}
+
+# NOTE: this dynamic route MUST come after every other static /signals/* route
+# (e.g. /signals/history above) — FastAPI/Starlette matches routes in
+# registration order, so a /signals/{signal_id} declared earlier will swallow
+# /signals/history requests and try (and fail) to parse "history" as an int.
+@app.get("/signals/{signal_id}")
+def get_signal(signal_id: int, user=Depends(get_optional_user)):
+    with get_db() as db:
+        row = db.execute("""
+            SELECT s.*, u.username as provider_name
+            FROM signals s LEFT JOIN users u ON s.provider_id=u.id
+            WHERE s.id=?
+        """, (signal_id,)).fetchone()
+        if not row: raise HTTPException(404, "Signal not found")
+        return _expand_signal(row)
 
 # ── Providers & Copy Trading ──────────────────────────────────────────────────
 @app.post("/providers/register")
@@ -336,6 +443,39 @@ def my_provider_profile(user=Depends(get_current_user)):
         recompute_provider_stats(db, user["id"])
         row = db.execute("SELECT * FROM providers WHERE user_id=?", (user["id"],)).fetchone()
         return dict(row)
+
+@app.get("/providers/me/followers")
+def my_followers(user=Depends(get_current_user)):
+    """Lets a provider see who's following them, their copy settings, and their
+    trade stats on this provider's signals specifically."""
+    with get_db() as db:
+        prow = db.execute("SELECT id FROM providers WHERE user_id=?", (user["id"],)).fetchone()
+        if not prow:
+            raise HTTPException(404, "You haven't registered as a provider yet")
+        subs = db.execute("""
+            SELECT s.*, u.username, u.plan
+            FROM subscriptions s JOIN users u ON s.follower_id=u.id
+            WHERE s.provider_id=? AND s.is_active=1
+            ORDER BY s.created_at DESC
+        """, (user["id"],)).fetchall()
+        followers = []
+        for s in subs:
+            stats = db.execute("""
+                SELECT COUNT(*) c, COALESCE(SUM(pnl_usd),0) pnl,
+                       SUM(CASE WHEN status='closed' AND pnl_usd>0 THEN 1 ELSE 0 END) wins,
+                       SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) closed
+                FROM copy_trades WHERE follower_id=? AND provider_id=?
+            """, (s["follower_id"], user["id"])).fetchone()
+            followers.append({
+                "follower_id": s["follower_id"], "username": s["username"], "plan": s["plan"],
+                "auto_copy": bool(s["auto_copy"]), "min_confidence": s["min_confidence"],
+                "risk_pct": s["risk_pct"], "max_lot": s["max_lot"],
+                "subscribed_since": s["created_at"],
+                "trades_copied": stats["c"], "trades_closed": stats["closed"],
+                "wins": stats["wins"] or 0,
+                "pnl_from_your_signals": round(stats["pnl"] or 0, 2),
+            })
+        return {"count": len(followers), "followers": followers}
 
 @app.put("/providers/me")
 def update_provider_profile(req: ProviderUpdateReq, user=Depends(get_current_user)):
@@ -387,16 +527,123 @@ def copy_signal_manually(signal_id: int, req: CopySignalReq, user=Depends(get_cu
                 raise HTTPException(400, "Connect your MT5 bridge in Profile first (Profile > MT5 Auto-Trading)")
             live = True
 
+        margin = compute_margin_usd(sig["pair"], req.lot_size)
+        fresh_balance = db.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
+        if fresh_balance < margin:
+            raise HTTPException(400, f"Insufficient balance — this trade needs ${margin:.2f} margin, "
+                                      f"you have ${fresh_balance:.2f}. Reduce lot size or top up.")
+
         exec_mode = "mt5" if live else "simulated"
         status0   = "pending_bridge" if live else "open"
         cur = db.execute("""INSERT INTO copy_trades
             (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
-             stop_loss,take_profit,status,execution_mode,opened_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+             stop_loss,take_profit,status,execution_mode,opened_at,margin_used)
+            VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?)""",
             (user["id"], sig["provider_id"], signal_id, req.lot_size, req.risk_pct,
-             sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode))
+             sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode, margin))
+        # Reserve the margin immediately — it's released back (plus/minus P&L) on close
+        db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
         return {"copied": True, "copy_trade_id": cur.lastrowid, "pair": sig["pair"],
-                "direction": sig["direction"], "execution_mode": exec_mode}
+                "direction": sig["direction"], "execution_mode": exec_mode, "margin_reserved": margin}
+
+FOREX_ONLY_PAIRS = {"EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","EURGBP","EURJPY","GBPJPY"}
+
+@app.post("/trades/quick")
+def place_quick_trade(req: QuickTradeReq, user=Depends(get_current_user)):
+    """Lets a user place a trade straight from the price chart instead of copying
+    a generated signal — same execution/margin machinery as a copied signal."""
+    if req.pair not in PAIR_CONFIG: raise HTTPException(400, "Unknown pair")
+    if req.pair not in FOREX_ONLY_PAIRS:
+        raise HTTPException(400, "Direct trade placement is limited to forex currency pairs")
+    if req.direction not in ("BUY", "SELL"): raise HTTPException(400, "direction must be BUY or SELL")
+    quote = get_live_quote(req.pair)
+    entry = float(quote["ask"] if req.direction == "BUY" else quote["bid"])
+    _, _, pip, _, _ = PAIR_CONFIG[req.pair]
+    sl = entry - req.sl_pips * pip if req.direction == "BUY" else entry + req.sl_pips * pip
+    tp = entry + req.tp_pips * pip if req.direction == "BUY" else entry - req.tp_pips * pip
+
+    with get_db() as db:
+        live = False
+        if req.execute_live:
+            u = db.execute("SELECT bridge_token FROM users WHERE id=?", (user["id"],)).fetchone()
+            if not u or not u["bridge_token"]:
+                raise HTTPException(400, "Connect your MT5 bridge in Profile first")
+            live = True
+        margin = compute_margin_usd(req.pair, req.lot_size)
+        balance = db.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
+        if balance < margin:
+            raise HTTPException(400, f"Insufficient balance — needs ${margin:.2f} margin, you have ${balance:.2f}")
+        exec_mode = "mt5" if live else "simulated"
+        status0 = "pending_bridge" if live else "open"
+        cur = db.execute("""INSERT INTO copy_trades
+            (follower_id,provider_id,signal_id,lot_size,risk_pct,entry_price,
+             stop_loss,take_profit,status,execution_mode,opened_at,margin_used,pair,direction)
+            VALUES (?,NULL,NULL,?,?,?,?,?,?,?,datetime('now'),?,?,?)""",
+            (user["id"], req.lot_size, 2.0, round(entry, 5), round(sl, 5), round(tp, 5), status0, exec_mode,
+             margin, req.pair, req.direction))
+        db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
+        return {"placed": True, "copy_trade_id": cur.lastrowid, "entry_price": round(entry, 5),
+                "stop_loss": round(sl, 5), "take_profit": round(tp, 5), "margin_reserved": margin,
+                "execution_mode": exec_mode, "pair": req.pair, "direction": req.direction}
+
+@app.post("/copy/trades/{trade_id}/close")
+def close_trade_manually(trade_id: int, user=Depends(get_current_user)):
+    """Manual close at current market price — for quick trades placed straight from
+    the chart (these have no signal to auto-settle) and for closing any open
+    position early instead of waiting for TP/SL."""
+    with get_db() as db:
+        t = db.execute("""SELECT ct.*, COALESCE(ct.pair, s.pair) as pair0, COALESCE(ct.direction, s.direction) as direction0
+                           FROM copy_trades ct LEFT JOIN signals s ON ct.signal_id=s.id
+                           WHERE ct.id=? AND ct.follower_id=? AND ct.status='open'""",
+                        (trade_id, user["id"])).fetchone()
+        if not t: raise HTTPException(404, "Open trade not found")
+        pair, direction = t["pair0"], t["direction0"]
+        if not pair: raise HTTPException(400, "Can't determine this trade's pair")
+        quote = get_live_quote(pair)
+        close_price = float(quote["bid"] if direction == "BUY" else quote["ask"])
+        _, _, pip, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+        pnl_pips = (close_price - t["entry_price"]) / pip * (1 if direction == "BUY" else -1)
+        pnl_usd = pip_value_usd(pair, pnl_pips, t["lot_size"])
+        result = "win" if pnl_usd > 0 else ("loss" if pnl_usd < 0 else "breakeven")
+        db.execute("""UPDATE copy_trades SET status='closed', result=?, pnl_pips=?, pnl_usd=?,
+                      close_price=?, closed_at=datetime('now') WHERE id=?""",
+                   (result, round(pnl_pips, 1), pnl_usd, close_price, trade_id))
+        db.execute("UPDATE users SET balance = balance + ? WHERE id=?",
+                   (float(t["margin_used"] or 0) + pnl_usd, user["id"]))
+        db.execute("""INSERT INTO trade_journal
+            (user_id,pair,direction,entry_price,exit_price,lot_size,pnl_usd,pnl_pips,notes,setup)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (user["id"], pair, direction, t["entry_price"], close_price, t["lot_size"], pnl_usd, pnl_pips,
+             "Manually closed", "Auto (Copy Trade)" if t["signal_id"] else "Auto (Quick Trade)"))
+        return {"closed": True, "close_price": close_price, "pnl_usd": round(pnl_usd, 2), "pnl_pips": round(pnl_pips, 1)}
+def approve_pending_copy(trade_id: int, user=Depends(get_current_user)):
+    """Follower approves a manual-mode copy suggestion — this is the moment margin
+    actually gets reserved, matching the manual-copy flow on the Signals page."""
+    with get_db() as db:
+        t = db.execute("SELECT * FROM copy_trades WHERE id=? AND follower_id=?", (trade_id, user["id"])).fetchone()
+        if not t: raise HTTPException(404, "Pending trade not found")
+        if t["status"] != "pending_approval": raise HTTPException(400, "This trade is no longer pending")
+        sig = db.execute("SELECT pair, status FROM signals WHERE id=?", (t["signal_id"],)).fetchone()
+        if sig and sig["status"] != "active":
+            db.execute("UPDATE copy_trades SET status='failed', fail_reason='Signal closed before approval' WHERE id=?", (trade_id,))
+            raise HTTPException(400, "This signal already closed — can't approve it anymore")
+        pair = sig["pair"] if sig else "EURUSD"
+        margin = compute_margin_usd(pair, t["lot_size"])
+        balance = db.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
+        if balance < margin:
+            raise HTTPException(400, f"Insufficient balance — needs ${margin:.2f} margin, you have ${balance:.2f}")
+        db.execute("UPDATE copy_trades SET status='open', margin_used=?, opened_at=datetime('now') WHERE id=?", (margin, trade_id))
+        db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
+        return {"approved": True, "margin_reserved": margin}
+
+@app.post("/copy/trades/{trade_id}/decline")
+def decline_pending_copy(trade_id: int, user=Depends(get_current_user)):
+    with get_db() as db:
+        t = db.execute("SELECT id FROM copy_trades WHERE id=? AND follower_id=? AND status='pending_approval'",
+                        (trade_id, user["id"])).fetchone()
+        if not t: raise HTTPException(404, "Pending trade not found")
+        db.execute("UPDATE copy_trades SET status='declined' WHERE id=?", (trade_id,))
+        return {"declined": True}
 
 @app.get("/providers")
 def list_providers(user=Depends(get_optional_user)):
@@ -425,6 +672,13 @@ def get_provider(provider_id: int, user=Depends(get_optional_user)):
 @app.post("/copy/subscribe")
 def subscribe(req: SubscribeReq, user=Depends(get_current_user)):
     with get_db() as db:
+        provider_row = db.execute(
+            "SELECT id FROM providers WHERE user_id=? AND is_active=1", (req.provider_id,)).fetchone()
+        if not provider_row:
+            raise HTTPException(404, "That user isn't an active signal provider")
+        if req.provider_id == user["id"]:
+            raise HTTPException(400, "You can't subscribe to your own provider profile")
+
         # Check not already subscribed
         existing = db.execute(
             "SELECT id FROM subscriptions WHERE follower_id=? AND provider_id=? AND is_active=1",
@@ -450,10 +704,11 @@ def subscribe(req: SubscribeReq, user=Depends(get_current_user)):
         db.execute("UPDATE providers SET followers_count=followers_count+1 WHERE user_id=?",
                    (req.provider_id,))
         
+        mode_msg = "You are now copying trades automatically." if req.auto_copy else \
+                   "Manual mode — you'll get a notification to review and approve each signal before it opens."
         db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Copy Trading Activated",
-                    "You are now copying trades automatically."))
-        return {"success": True, "message": "Subscribed successfully. Auto-copy is active."}
+                   (user["id"], "copy", "Copy Trading Activated", mode_msg))
+        return {"success": True, "message": mode_msg}
 
 @app.delete("/copy/unsubscribe/{provider_id}")
 def unsubscribe(provider_id: int, user=Depends(get_current_user)):
@@ -468,10 +723,11 @@ def unsubscribe(provider_id: int, user=Depends(get_current_user)):
 def my_copy_trades(user=Depends(get_current_user)):
     with get_db() as db:
         trades = db.execute("""
-            SELECT ct.*, u.username as provider_name, s.pair, s.timeframe,
-                   s.direction, s.ai_analysis, s.candle_pattern
+            SELECT ct.*, COALESCE(u.username, 'ForexPro AI') as provider_name,
+                   COALESCE(ct.pair, s.pair) as pair, s.timeframe,
+                   COALESCE(ct.direction, s.direction) as direction, s.ai_analysis, s.candle_pattern
             FROM copy_trades ct
-            JOIN users u ON ct.provider_id=u.id
+            LEFT JOIN users u ON ct.provider_id=u.id
             LEFT JOIN signals s ON ct.signal_id=s.id
             WHERE ct.follower_id=?
             ORDER BY ct.created_at DESC LIMIT 50
@@ -521,8 +777,13 @@ def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 500)
     df = get_ohlcv(pair, timeframe, candles + 250)
     df = add_indicators(df)
     tail = df.tail(candles)
+    _, _, pip_sz, _, _ = PAIR_CONFIG[pair]
     records = []
     for ts, row in tail.iterrows():
+        rng = max(float(row["high"]) - float(row["low"]), pip_sz * 0.1)
+        # No real broker tick-volume feed — approximate relative activity from
+        # candle range + body size so the chart still has a meaningful volume pane.
+        volume = int(rng / pip_sz * 37 + abs(float(row["close"]) - float(row["open"])) / pip_sz * 20)
         records.append({
             "time": int(pd.Timestamp(ts).timestamp()), "open": round(float(row["open"]),5), # type: ignore
             "high": round(float(row["high"]),5), "low": round(float(row["low"]),5),
@@ -530,6 +791,7 @@ def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 500)
             "ema50": round(float(row["ema50"]),5), "bb_up": round(float(row["bb_up"]),5),
             "bb_low": round(float(row["bb_low"]),5), "rsi": round(float(row["rsi"]),2),
             "macd_h": round(float(row["macd_h"]),6), "stoch_k": round(float(row["stoch_k"]),2),
+            "volume": max(volume, 1),
         })
     direction = "BUY" if float(tail["ema20"].iloc[-1]) > float(tail["ema50"].iloc[-1]) else "SELL"
     return {
@@ -640,8 +902,19 @@ def get_notifications(user=Depends(get_current_user)):
         rows = db.execute(
             "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50",
             (user["id"],)).fetchall()
-        db.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (user["id"],))
         return {"notifications": [dict(r) for r in rows]}
+
+@app.post("/notifications/{notif_id}/read")
+def mark_notification_read(notif_id: int, user=Depends(get_current_user)):
+    with get_db() as db:
+        db.execute("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?", (notif_id, user["id"]))
+    return {"success": True}
+
+@app.post("/notifications/read-all")
+def mark_all_notifications_read(user=Depends(get_current_user)):
+    with get_db() as db:
+        db.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (user["id"],))
+    return {"success": True}
 
 # ── Dashboard Stats ───────────────────────────────────────────────────────────
 @app.get("/account/usage")
@@ -911,6 +1184,17 @@ def settle_once():
                 db.execute("""UPDATE copy_trades SET status='closed', result=?, pnl_pips=?,
                               pnl_usd=?, closed_at=datetime('now') WHERE id=?""",
                            (result, pnl_pips, pnl_usd, t["id"]))
+                # Release the reserved margin back and apply realized P&L — this is
+                # what actually moves the user's balance for a copy trade.
+                db.execute("UPDATE users SET balance = balance + ? WHERE id=?",
+                           (float(t["margin_used"] or 0) + pnl_usd, t["follower_id"]))
+                # Auto-log into the trade journal so followers get a unified record
+                # of manual entries + copy trades without doing anything extra.
+                db.execute("""INSERT INTO trade_journal
+                    (user_id,pair,direction,entry_price,exit_price,lot_size,pnl_usd,pnl_pips,notes,setup)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (t["follower_id"], sig["pair"], sig["direction"], t["entry_price"], close_price,
+                     t["lot_size"], pnl_usd, pnl_pips, "Auto-logged from copy trade", "Auto (Copy Trade)"))
                 db.execute("""INSERT INTO notifications (user_id,type,title,message)
                               VALUES (?,?,?,?)""",
                            (t["follower_id"], "trade_closed",

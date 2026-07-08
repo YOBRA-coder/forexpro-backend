@@ -3,7 +3,6 @@ ForexPro Stripe Payment Integration
 ─────────────────────────────────────
 Handles provider subscription payments via Stripe.
 
-
 Plans:
   FREE     — 0 providers, limited signals
   PRO      — up to 3 providers, $9.99/mo

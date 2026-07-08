@@ -17,10 +17,9 @@ from email.utils import formatdate
 from types import FrameType
 from typing import TYPE_CHECKING, TypeAlias
 
-import click
-
+from uvicorn._ansi import style
 from uvicorn._compat import asyncio_run
-from uvicorn.config import Config
+from uvicorn.config import STARTUP_FAILURE, Config
 
 if TYPE_CHECKING:
     from uvicorn.protocols.http.h11_impl import H11Protocol
@@ -88,7 +87,7 @@ class Server:
         self.lifespan = config.lifespan_class(config)
 
         message = "Started server process [%d]"
-        color_message = "Started server process [" + click.style("%d", fg="cyan") + "]"
+        color_message = "Started server process [" + style("%d", fg="cyan") + "]"
         logger.info(message, process_id, extra={"color_message": color_message})
 
         await self.startup(sockets=sockets)
@@ -98,14 +97,13 @@ class Server:
             await self.shutdown(sockets=sockets)
 
             message = "Finished server process [%d]"
-            color_message = "Finished server process [" + click.style("%d", fg="cyan") + "]"
+            color_message = "Finished server process [" + style("%d", fg="cyan") + "]"
             logger.info(message, process_id, extra={"color_message": color_message})
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         await self.lifespan.startup()
         if self.lifespan.should_exit:
-            self.should_exit = True
-            return
+            sys.exit(STARTUP_FAILURE)
 
         config = self.config
 
@@ -179,7 +177,7 @@ class Server:
             except OSError as exc:
                 logger.error(exc)
                 await self.lifespan.shutdown()
-                sys.exit(1)
+                sys.exit(STARTUP_FAILURE)
 
             assert server.sockets is not None
             listeners = server.sockets
@@ -220,7 +218,7 @@ class Server:
 
             protocol_name = "https" if config.ssl else "http"
             message = f"Uvicorn running on {addr_format} (Press CTRL+C to quit)"
-            color_message = "Uvicorn running on " + click.style(addr_format, bold=True) + " (Press CTRL+C to quit)"
+            color_message = "Uvicorn running on " + style(addr_format, bold=True) + " (Press CTRL+C to quit)"
             logger.info(
                 message,
                 protocol_name,

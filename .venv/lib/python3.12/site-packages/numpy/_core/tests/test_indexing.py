@@ -12,7 +12,6 @@ from numpy._core._multiarray_tests import array_indexing
 from numpy.exceptions import ComplexWarning, VisibleDeprecationWarning
 from numpy.testing import (
     HAS_REFCOUNT,
-    IS_PYPY,
     assert_,
     assert_array_equal,
     assert_equal,
@@ -1366,6 +1365,22 @@ class TestBooleanIndexing:
             "size of axis is 1 but size of corresponding boolean axis is 2",
             lambda: a[idx])
 
+    def test_assignment_cast_error_aborts_iteration(self):
+        # A failing cast must abort the assignment: no further chunks may
+        # be processed and the error must be raised. The iteration used to
+        # continue after a failed chunk, relying on every later cast call
+        # failing fast on the pending exception to keep the error alive.
+        a = np.zeros((40, 30))[:, ::2]
+        mask = np.zeros(a.shape, dtype=bool)
+        mask[:2] = True
+        mask[2:, :5] = True
+        vals = np.arange(float(mask.sum())).astype(object)
+        vals[29] = object()
+        with pytest.raises(TypeError):
+            a[mask] = vals
+        # rows after the failing chunk are untouched
+        assert not a[2:].any()
+
 
 class TestArrayToIndexDeprecation:
     """Creating an index from array not 0-D is an error.
@@ -1677,7 +1692,6 @@ class TestFlatiterIndexing:
 
 
 @pytest.mark.skipif(sys.flags.optimize == 2, reason="Python running -OO")
-@pytest.mark.xfail(IS_PYPY, reason="PyPy does not modify tp_doc")
 @pytest.mark.parametrize("methodname", ["__array__", "copy"])
 def test_flatiter_method_signatures(methodname: str):
     method = getattr(np.flatiter, methodname)

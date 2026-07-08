@@ -15,7 +15,13 @@ from wsproto.connection import ConnectionState
 from wsproto.extensions import Extension, PerMessageDeflate
 from wsproto.utilities import LocalProtocolError, RemoteProtocolError
 
-from uvicorn._types import ASGI3Application, ASGISendEvent, WebSocketEvent, WebSocketReceiveEvent, WebSocketScope
+from uvicorn._types import (
+    ASGI3Application,
+    ASGISendEvent,
+    WebSocketEvent,
+    WebSocketReceiveEvent,
+    WebSocketScope,
+)
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.utils import (
@@ -75,6 +81,7 @@ class WSProtocol(asyncio.Protocol):
         self.loop = _loop or asyncio.get_event_loop()
         self.logger = logging.getLogger("uvicorn.error")
         self.root_path = config.root_path
+        self.asgi_version = config.asgi_version
         self.app_state = app_state
 
         # Shared server state
@@ -151,6 +158,10 @@ class WSProtocol(asyncio.Protocol):
             # TODO: Remove `type: ignore` when wsproto fixes the type annotation.
             self.transport.write(self.conn.send(err.event_hint))  # type: ignore[arg-type]  # noqa: E501
             self.transport.close()
+        except LocalProtocolError:
+            # Data received after the close handshake completed, e.g. a pong the client
+            # sent while the server's close was in flight.
+            self.transport.close()
         else:
             self.handle_events()
 
@@ -205,7 +216,7 @@ class WSProtocol(asyncio.Protocol):
         full_raw_path = self.root_path.encode("ascii") + raw_path.encode("ascii")
         self.scope: WebSocketScope = {
             "type": "websocket",
-            "asgi": {"version": self.config.asgi_version, "spec_version": "2.4"},
+            "asgi": {"version": self.asgi_version, "spec_version": "2.4"},
             "http_version": "1.1",
             "scheme": self.scheme,
             "server": self.server,

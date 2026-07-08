@@ -138,6 +138,9 @@ def report_fill(
         else:
             db.execute("""UPDATE copy_trades SET status='failed', fail_reason=? WHERE id=?""",
                        (error_msg or "EA reported failure", copy_trade_id))
+            # The order never actually opened on the broker — give the reserved margin back.
+            if ct["margin_used"]:
+                db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (ct["margin_used"], user["id"]))
     return {"ok": True}
 
 
@@ -156,6 +159,14 @@ def report_close(
                       close_price=?, mt5_ticket=COALESCE(NULLIF(?,''), mt5_ticket),
                       closed_at=datetime('now') WHERE id=?""",
                    (result, pnl_pips, pnl_usd, close_price, ticket, copy_trade_id))
+        # Real MT5 P&L is authoritative here — release the reserved margin and apply it.
+        db.execute("UPDATE users SET balance = balance + ? WHERE id=?",
+                   (float(ct["margin_used"] or 0) + pnl_usd, user["id"]))
+        db.execute("""INSERT INTO trade_journal
+            (user_id,pair,direction,entry_price,exit_price,lot_size,pnl_usd,pnl_pips,notes,setup)
+            SELECT ?, s.pair, s.direction, ?, ?, ?, ?, ?, 'Auto-logged from MT5 copy trade', 'Auto (MT5 Copy Trade)'
+            FROM signals s WHERE s.id=?""",
+            (user["id"], ct["entry_price"], close_price, ct["lot_size"], pnl_usd, pnl_pips, ct["signal_id"]))
         db.execute("""INSERT INTO notifications (user_id,type,title,message)
                       VALUES (?,?,?,?)""",
                    (user["id"], "trade_closed", f"MT5 trade {result.upper()}",

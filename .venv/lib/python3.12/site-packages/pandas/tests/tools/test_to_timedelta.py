@@ -242,7 +242,7 @@ class TestTimedeltas:
 
     def test_to_timedelta_on_missing_values(self):
         # GH5438
-        timedelta_NaT = np.timedelta64("NaT")
+        timedelta_NaT = np.timedelta64("NaT", "ns")
 
         actual = to_timedelta(Series(["00:00:01", np.nan]))
         expected = Series(
@@ -258,12 +258,12 @@ class TestTimedeltas:
     @pytest.mark.parametrize("val", [np.nan, pd.NaT, pd.NA])
     def test_to_timedelta_on_missing_values_scalar(self, val):
         actual = to_timedelta(val)
-        assert actual._value == np.timedelta64("NaT").astype("int64")
+        assert actual._value == np.timedelta64("NaT", "ns").astype("int64")
 
     @pytest.mark.parametrize("val", [np.nan, pd.NaT, pd.NA])
     def test_to_timedelta_on_missing_values_list(self, val):
         actual = to_timedelta([val])
-        assert actual[0]._value == np.timedelta64("NaT").astype("int64")
+        assert actual[0]._value == np.timedelta64("NaT", "ns").astype("int64")
 
     @pytest.mark.skipif(WASM, reason="No fp exception support in WASM")
     @pytest.mark.xfail(not IS64, reason="Floating point error")
@@ -357,6 +357,18 @@ class TestTimedeltas:
         arr2 = arr.astype(np.float64)
         result2 = to_timedelta(arr2, unit="s")
         assert result2.unit == "ns"
+
+    def test_to_timedelta_unit_mixed_round_and_non_round_floats(self):
+        # GH#65150 - round floats mixed with non-round floats should
+        # respect the unit for all values
+        expected = to_timedelta(["0 days 00:00:01", "0 days 00:00:01.01"]).as_unit("ns")
+
+        result = to_timedelta([1.0, 1.01], unit="s")
+        tm.assert_index_equal(result, expected)
+
+        # Also test integers mixed with non-round floats
+        result2 = to_timedelta([1, 1.01], unit="s")
+        tm.assert_index_equal(result2, expected)
 
 
 def test_from_numeric_arrow_dtype(any_numeric_ea_dtype):

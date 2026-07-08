@@ -208,6 +208,11 @@ def init_db():
         _migrate_users_table(db)
         # Seed demo users
         _seed_demo_data(db)
+        # Education courses are seeded independently of the users check above —
+        # on any DB that already had real users (i.e. anything past initial setup),
+        # the old code's single "if users table is empty" guard meant this content
+        # never got inserted at all, leaving the Education page permanently empty.
+        _seed_education_courses(db)
     print(f"[DB] SQLite initialized at {DB_PATH}")
 
 def _migrate_users_table(db):
@@ -230,6 +235,9 @@ def _migrate_users_table(db):
         "mpesa_phone":             "TEXT",
         "bridge_token":            "TEXT",
         "bridge_connected_at":     "TEXT",
+        "email_alerts_enabled":    "INTEGER DEFAULT 1",
+        "default_lot_size":        "REAL DEFAULT 0.02",
+        "default_risk_pct":        "REAL DEFAULT 2.0",
     })
     add_cols("signals", {"chart_data": "TEXT"})
     add_cols("copy_trades", {
@@ -237,6 +245,9 @@ def _migrate_users_table(db):
         "mt5_ticket":      "TEXT",
         "fail_reason":     "TEXT",
         "close_price":     "REAL",
+        "margin_used":     "REAL DEFAULT 0",  # cash reserved from user.balance while this trade is open
+        "pair":            "TEXT",  # set directly for quick trades (no signal_id to join through)
+        "direction":       "TEXT",
     })
     add_cols("subscriptions", {"auto_execute": "INTEGER DEFAULT 0"})
 
@@ -266,7 +277,13 @@ def _seed_demo_data(db):
     # Subscription: Yobby follows TopTrader
     db.execute("INSERT INTO subscriptions (follower_id,provider_id,risk_pct,max_lot,min_confidence,auto_copy) VALUES (3,2,2.0,0.05,65,1)")
 
-    # Seed education courses
+    print("[DB] Demo data seeded")
+
+def _seed_education_courses(db):
+    # Guarded independently of _seed_demo_data — see the call site comment in init_db.
+    existing = db.execute("SELECT COUNT(*) FROM education_courses").fetchone()[0]
+    if existing > 0:
+        return
     courses = [
         ("Forex Fundamentals","Everything you need to know to start trading forex safely","basics","beginner",json.dumps([
             {"title":"What is Forex?","content":"The foreign exchange market is the largest financial market in the world with $6.6 trillion daily volume. You trade currency pairs — buying one currency while selling another.","quiz":[{"q":"What does EUR/USD mean?","options":["Buy Euros, sell USD","EUR is base, USD is quote","Both A and B"],"answer":2}],"duration":5},
@@ -305,8 +322,7 @@ def _seed_demo_data(db):
     for title, desc, cat, level, lessons in courses:
         db.execute("INSERT INTO education_courses (title,description,category,level,lessons) VALUES (?,?,?,?,?)",
                    (title, desc, cat, level, lessons))
-
-    print("[DB] Demo data seeded")
+    print("[DB] Education courses seeded")
 
 def is_subscription_active(user: dict) -> bool:
     """True if the user's paid subscription is currently valid (free plan is always 'active')."""

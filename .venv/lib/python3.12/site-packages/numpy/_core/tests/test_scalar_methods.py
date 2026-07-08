@@ -3,7 +3,6 @@ Test the scalar constructors, which also do type-coercion
 """
 import fractions
 import inspect
-import platform
 import sys
 import types
 from typing import Any, Literal
@@ -12,7 +11,8 @@ import pytest
 
 import numpy as np
 from numpy._core import sctypes
-from numpy.testing import IS_PYPY, assert_equal, assert_raises
+from numpy.testing import assert_equal, assert_raises
+from numpy.testing._private.utils import LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE
 
 
 class TestAsIntegerRatio:
@@ -87,7 +87,7 @@ class TestAsIntegerRatio:
                     np.finfo(np.double) == np.finfo(np.longdouble),
                     reason="long double is same as double"),
                 pytest.mark.skipif(
-                    platform.machine().startswith("ppc"),
+                    LONG_DOUBLE_IS_IBM_DOUBLE_DOUBLE,
                     reason="IBM double double"),
             ]
         )
@@ -257,7 +257,6 @@ def test_array_wrap(scalar):
 
 
 @pytest.mark.skipif(sys.flags.optimize == 2, reason="Python running -OO")
-@pytest.mark.skipif(IS_PYPY, reason="PyPy does not modify tp_doc")
 class TestSignature:
     # test that scalar types have a valid __text_signature__ or __signature__ set
     @pytest.mark.parametrize(
