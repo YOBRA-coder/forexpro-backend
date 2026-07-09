@@ -224,8 +224,12 @@ async def _on_checkout_complete(session: dict):
             print(f"Webhook: User {user_id} completed registration payment")
             return
 
-        # Map plan name to DB plan
-        db_plan = "elite" if "elite" in plan else "pro"
+        # Store the plan id exactly as sold (must match PLAN_LIMITS keys in database.py:
+        # 'trader_pro' | 'trader_elite' | 'provider_pro'). Previously this collapsed
+        # everything down to just 'elite'/'pro', which don't match any PLAN_LIMITS key —
+        # so every paying customer silently kept free-tier usage limits, and a
+        # provider_pro purchase lost provider access entirely (mapped to plain 'pro').
+        db_plan = plan if plan in ("trader_pro", "trader_elite", "provider_pro") else "trader_pro"
         db_role = "provider" if "provider" in plan else None
         expires = (datetime.utcnow() + timedelta(days=30)).isoformat()
 

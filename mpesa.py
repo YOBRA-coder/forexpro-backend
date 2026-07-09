@@ -50,12 +50,12 @@ SHORTCODE       = os.getenv("MPESA_SHORTCODE", "174379")
 PASSKEY         = os.getenv("MPESA_PASSKEY", "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919")
 CALLBACK_URL    = os.getenv("MPESA_CALLBACK_URL", "https://example.com/payments/mpesa/callback")
 
-REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "2"))
+REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "1"))
 SUBSCRIPTION_PRICES_KES = {
     "trader_pro":     1,
-    "trader_elite":   2,
-    "provider_basic": 3,
-    "provider_pro":   4,
+    "trader_elite":   1,
+    "provider_basic": 1,
+    "provider_pro":   1,
 }
 
 router = APIRouter(prefix="/payments/mpesa", tags=["mpesa"])
@@ -210,7 +210,7 @@ async def mpesa_callback(payload: dict):
                     expires = (datetime.now() + timedelta(days=30)).isoformat()
                     role_update = ""
                     plan = row["plan"] or "trader_pro"
-                    db_plan = "elite" if "elite" in plan else "pro"
+                    db_plan = plan if plan in ("trader_pro", "trader_elite", "provider_pro") else "trader_pro"
                     db.execute(
                         "UPDATE users SET plan=?, subscription_status='active', subscription_expires_at=?, mpesa_phone=? WHERE id=?",
                         (db_plan, expires, row["phone"], row["user_id"])

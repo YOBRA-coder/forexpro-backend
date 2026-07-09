@@ -139,6 +139,22 @@ def compute_cci(h, l, c, p=20):
     md = tp.rolling(p).apply(lambda x: np.mean(np.abs(x - x.mean())))
     return (tp - ma) / (0.015 * md + 1e-10)
 
+def compute_adx(h, l, c, p=14):
+    """Wilder's ADX + directional indicators. ADX > ~20-25 indicates a market with
+    enough trend strength to trade directionally; below that, price is chopping
+    sideways and directional signals are unreliable regardless of indicator votes."""
+    up_move = h.diff()
+    down_move = -l.diff()
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr_w = tr.ewm(alpha=1/p, adjust=False).mean()
+    plus_di  = 100 * pd.Series(plus_dm, index=h.index).ewm(alpha=1/p, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=h.index).ewm(alpha=1/p, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/p, adjust=False).mean()
+    return adx.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l = df["close"], df["high"], df["low"]
     df["ema20"]  = ema(c, 20)
@@ -150,6 +166,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"]    = compute_atr(h, l, c)
     df["stoch_k"], df["stoch_d"] = compute_stoch(h, l, c)
     df["cci"]    = compute_cci(h, l, c)
+    df["adx"], df["plus_di"], df["minus_di"] = compute_adx(h, l, c)
     return df.dropna()
 
 # ── Pattern Detection ─────────────────────────────────────────────────────────
@@ -185,17 +202,73 @@ def detect_chart_pattern(df) -> str:
     return "No Clear Pattern"
 
 # ── Signal Builder ────────────────────────────────────────────────────────────
+NO_TRADE_ADX_FLOOR = 18       # below this, ADX says the market isn't trending — don't force a direction
+NO_TRADE_VOTE_MARGIN = 1      # BUY vs SELL votes must differ by more than this to take a side
+
+def _low_liquidity_window(now=None) -> Optional[str]:
+    """Cheap heuristic for illiquid/high-slippage windows: weekend market close/open
+    and the NY->Sydney rollover hour (21:00-22:00 GMT) where spreads widen and
+    price action gets noisy. This is NOT a real economic-calendar/news feed —
+    there's no news API key configured — so it only catches predictable liquidity
+    gaps, not scheduled data releases (NFP, CPI, rate decisions, etc). Wire in a
+    calendar provider (e.g. ForexFactory/TradingEconomics API) for real news avoidance."""
+    now = now or datetime.utcnow()
+    if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 21):
+        return "Weekend — forex market closed"
+    if now.weekday() == 4 and now.hour >= 21:
+        return "Market closing for the weekend — low liquidity"
+    if now.hour == 21:
+        return "NY/Sydney rollover — spreads widen, low liquidity"
+    return None
+
 def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int = None) -> dict:
     row  = df.iloc[-1]; prev = df.iloc[-2]
     price = float(row["close"]); atr = float(row["atr"])
     _, _, pip, spread, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
 
-    votes_buy = sum([
+    votes_buy_list = [
         row["ema20"] > row["ema50"], row["close"] > row["ema200"],
         row["rsi"] < 50, row["macd_h"] > 0,
         row["stoch_k"] < 50, row["close"] < row["bb_mid"],
-    ])
-    direction = "BUY" if votes_buy >= 3 else "SELL"
+        row["plus_di"] > row["minus_di"],
+    ]
+    votes_buy = sum(votes_buy_list)
+    votes_sell = len(votes_buy_list) - votes_buy
+    adx = float(row["adx"])
+    liquidity_note = _low_liquidity_window()
+
+    # NO TRADE: votes basically tied (no real edge either way), or ADX says the
+    # market is ranging/choppy rather than trending, or we're in a low-liquidity
+    # window where any edge is likely to get eaten by spread/slippage anyway.
+    no_trade_reason = None
+    if abs(votes_buy - votes_sell) <= NO_TRADE_VOTE_MARGIN:
+        no_trade_reason = f"Indicators split {votes_buy}-{votes_sell} — no clear directional edge"
+    elif adx < NO_TRADE_ADX_FLOOR:
+        no_trade_reason = f"ADX {adx:.1f} — market is ranging, not trending (need {NO_TRADE_ADX_FLOOR}+)"
+    elif liquidity_note:
+        no_trade_reason = liquidity_note
+
+    if no_trade_reason:
+        return {
+            "provider_id": provider_id, "pair": pair, "timeframe": timeframe,
+            "direction": "NO_TRADE", "strength": "AVOID", "confidence": 0,
+            "entry_price": round(price, 5), "stop_loss": None, "take_profit": None,
+            "sl_pips": 0, "tp_pips": 0, "risk_reward": 0,
+            "support_resistance": detect_support_resistance(df), "trendline": detect_trendline(df),
+            "markers": [], "atr": round(atr, 5), "rsi": round(float(row["rsi"]), 2),
+            "macd": round(float(row["macd"]), 6), "macd_signal": round(float(row["macd_s"]), 6),
+            "macd_hist": round(float(row["macd_h"]), 6), "ema20": round(float(row["ema20"]), 5),
+            "ema50": round(float(row["ema50"]), 5), "bb_upper": round(float(row["bb_up"]), 5),
+            "bb_lower": round(float(row["bb_low"]), 5), "stoch_k": round(float(row["stoch_k"]), 2),
+            "adx": round(adx, 1), "candle_pattern": detect_candle(row, prev),
+            "chart_pattern": detect_chart_pattern(df),
+            "entry_time": datetime.now().isoformat(), "expires_at": datetime.now().isoformat(),
+            "ai_analysis": f"NO TRADE — {no_trade_reason}. ADX {adx:.1f}, votes {votes_buy}-{votes_sell}. "
+                            f"Sitting out preserves capital until a clearer setup forms.",
+            "status": "no_trade",
+        }
+
+    direction = "BUY" if votes_buy > votes_sell else "SELL"
 
     score = 50; reasons = []
     checks = {
@@ -209,6 +282,8 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
             (row["close"]<=row["bb_low"],  8, "Price at lower Bollinger Band"),
             (row["cci"]<-100,              5, "CCI oversold"),
             (row["macd"]>row["macd_s"],    6, "MACD bullish crossover"),
+            (adx>=25,                      8, f"ADX {adx:.1f} confirms strong trend"),
+            (row["plus_di"]>row["minus_di"], 5, "+DI above -DI"),
         ],
         "SELL": [
             (row["ema20"]<row["ema50"],    8, "EMA20 < EMA50 (downtrend)"),
@@ -220,6 +295,8 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
             (row["close"]>=row["bb_up"],   8, "Price at upper Bollinger Band"),
             (row["cci"]>100,               5, "CCI overbought"),
             (row["macd"]<row["macd_s"],    6, "MACD bearish crossover"),
+            (adx>=25,                      8, f"ADX {adx:.1f} confirms strong trend"),
+            (row["minus_di"]>row["plus_di"], 5, "-DI above +DI"),
         ]
     }
     for cond, pts, reason in checks[direction]:
@@ -239,7 +316,7 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
                 "H4":"07:00-09:00 or 13:00-15:00 GMT","D1":"00:00 GMT Daily","W1":"Mon 00:00 GMT"}
 
     ai = (f"Confluences ({len(reasons)}): {'; '.join(reasons[:4])}. "
-          f"Pattern: {detect_candle(row,prev)}. "
+          f"Pattern: {detect_candle(row,prev)}. ADX {adx:.1f} ({'trending' if adx>=25 else 'developing trend'}). "
           f"AI Score: {score}/100. "
           f"{'High-conviction setup — manage with trailing stop.' if score>=75 else 'Moderate setup — use strict SL discipline.'}")
 
@@ -271,6 +348,7 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
         "bb_upper":      round(float(row["bb_up"]), 5),
         "bb_lower":      round(float(row["bb_low"]), 5),
         "stoch_k":       round(float(row["stoch_k"]), 2),
+        "adx":           round(adx, 1),
         "candle_pattern":detect_candle(row, prev),
         "chart_pattern": detect_chart_pattern(df),
         "entry_time":    sessions.get(timeframe, "London/NY Session"),
@@ -391,19 +469,39 @@ def compute_margin_usd(pair: str, lot_size: float) -> float:
     per_lot = 3000.0 if pair == "XAUUSD" else (2000.0 if pair == "BTCUSD" else 1000.0)
     return round(lot_size * per_lot, 2)
 
+def compute_risk_based_lot(balance: float, risk_pct: float, pair: str, sl_pips: float, max_lot: float) -> float:
+    """Proper position sizing: lot = (balance x risk%) / (SL distance in pips x pip value).
+    This is what actually makes risk_pct mean something — previously it was stored on
+    every subscription/trade but never used; every trade just took the flat max_lot
+    regardless of the account size or how far away the stop loss was, so a tight-SL
+    signal and a wide-SL signal risked wildly different amounts of real money for the
+    'same' risk_pct setting. max_lot still acts as a hard ceiling (a safety cap the
+    follower set), it just no longer IS the position size by default.
+    """
+    if sl_pips <= 0 or balance <= 0:
+        return round(min(max_lot, 0.01), 2)
+    per_pip_standard = 10.0 if pair != "XAUUSD" and pair != "BTCUSD" else (100.0 if pair == "XAUUSD" else 1.0)
+    risk_amount = balance * (risk_pct / 100.0)
+    lot = risk_amount / (sl_pips * per_pip_standard)
+    lot = max(0.01, min(lot, max_lot))
+    return round(lot, 2)
+
 def get_live_quote(pair: str) -> dict:
     """Get single live price quote"""
+    base, vol, pip, spread, _ = PAIR_CONFIG[pair]
     try:
         url = f"https://api.twelvedata.com/price?symbol={PAIR_CONFIG[pair][4]}&apikey=demo"
         req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         if "price" in data:
-            return {"pair": pair, "price": float(data["price"]), "source": "live"}
-    except: pass
-    
+            price = float(data["price"])
+            return {"pair": pair, "price": price,  "bid": round(price - spread*pip/2, 5), "ask": round(price + spread*pip/2, 5), "source": "live"}
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch live quote for {pair}: {e}")
+
     # Fallback
-    base, vol, pip, spread, _ = PAIR_CONFIG[pair]
+   
     import random
     rng = np.random.default_rng(int(datetime.now().strftime("%Y%m%d%H%M")) // 2 + abs(hash(pair)) % 9999)
     price = base * (1 + rng.normal(0, vol/base*0.25))
@@ -417,4 +515,107 @@ def get_live_quote(pair: str) -> dict:
         "low":  round(price - abs(rng.normal(0,vol*0.4)),5),
         "spread": spread, "direction": "up" if chg>=0 else "down",
         "source": "simulated", "timestamp": datetime.now().isoformat()
+    }
+
+# ── Backtester ────────────────────────────────────────────────────────────────
+def run_backtest(pair: str, timeframe: str, bars: int = 1000, seed: int = 7) -> dict:
+    """Walk-forward backtest: at every bar, build_signal() sees ONLY the data up to
+    that point (no lookahead), and if it fires a BUY/SELL we track forward bar by
+    bar until price actually touches SL or TP (or the signal's expiry passes with
+    neither hit, counted as an open/timeout). This tests the exact same decision
+    function used in live trading — not a separate/idealized backtest model —
+    so the win rate reported here is what you'd actually have gotten trading
+    this signal engine on this pair/timeframe.
+    """
+    warmup = 220  # bars needed before indicators (EMA200, ADX) are meaningful
+    df_full = synthetic_ohlcv(pair, timeframe, bars + warmup, seed=seed)
+    df_full = add_indicators(df_full).reset_index()
+    time_col = df_full.columns[0]
+
+    trades = []
+    open_trade = None
+    equity_curve = [0.0]
+    running_pips = 0.0
+    max_dd = 0.0
+    peak = 0.0
+    no_trade_count = 0
+
+    for i in range(warmup, len(df_full)):
+        window = df_full.iloc[max(0, i-210):i+1].set_index(time_col)
+        row = df_full.iloc[i]
+
+        # Manage an open trade first: did this bar touch SL or TP?
+        if open_trade:
+            hi, lo = float(row["high"]), float(row["low"])
+            hit = None
+            if open_trade["direction"] == "BUY":
+                if lo <= open_trade["sl"]: hit = ("loss", open_trade["sl"])
+                elif hi >= open_trade["tp"]: hit = ("win", open_trade["tp"])
+            else:
+                if hi >= open_trade["sl"]: hit = ("loss", open_trade["sl"])
+                elif lo <= open_trade["tp"]: hit = ("win", open_trade["tp"])
+            open_trade["bars_open"] += 1
+            if hit or open_trade["bars_open"] > 200:
+                result, exit_price = hit if hit else ("timeout", float(row["close"]))
+                pip_size = open_trade["pip"]
+                pips = (exit_price - open_trade["entry"]) / pip_size * (1 if open_trade["direction"] == "BUY" else -1)
+                running_pips += pips
+                peak = max(peak, running_pips)
+                max_dd = max(max_dd, peak - running_pips)
+                equity_curve.append(round(running_pips, 1))
+                trades.append({
+                    "entry_time": open_trade["entry_time"], "direction": open_trade["direction"],
+                    "entry": round(open_trade["entry"], 5), "exit": round(exit_price, 5),
+                    "result": result, "pips": round(pips, 1), "confidence": open_trade["confidence"],
+                })
+                open_trade = None
+            continue
+
+        try:
+            sig = build_signal(pair, timeframe, window)
+        except Exception:
+            continue
+        if sig["direction"] == "NO_TRADE":
+            no_trade_count += 1
+            continue
+        if sig["confidence"] < 60:
+            continue
+        _, _, pip_size, _, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
+        open_trade = {
+            "direction": sig["direction"], "entry": sig["entry_price"], "sl": sig["stop_loss"],
+            "tp": sig["take_profit"], "pip": pip_size, "bars_open": 0,
+            "confidence": sig["confidence"], "entry_time": str(row[time_col]),
+        }
+
+    wins = [t for t in trades if t["result"] == "win"]
+    losses = [t for t in trades if t["result"] == "loss"]
+    timeouts = [t for t in trades if t["result"] == "timeout"]
+    gross_win = sum(t["pips"] for t in wins)
+    gross_loss = abs(sum(t["pips"] for t in losses))
+    win_rate = round(len(wins) / len(trades) * 100, 1) if trades else 0.0
+    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (round(gross_win, 2) if gross_win else 0.0)
+
+    # Longest losing streak — the number a trader actually needs for position sizing
+    streak = max_streak = 0
+    for t in trades:
+        if t["result"] == "loss":
+            streak += 1; max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    return {
+        "pair": pair, "timeframe": timeframe, "bars_tested": bars,
+        "total_signals_fired": len(trades), "no_trade_bars": no_trade_count,
+        "wins": len(wins), "losses": len(losses), "timeouts": len(timeouts),
+        "win_rate_pct": win_rate, "profit_factor": profit_factor,
+        "total_pips": round(running_pips, 1), "max_drawdown_pips": round(max_dd, 1),
+        "max_consecutive_losses": max_streak,
+        "avg_win_pips": round(gross_win / len(wins), 1) if wins else 0.0,
+        "avg_loss_pips": round(-gross_loss / len(losses), 1) if losses else 0.0,
+        "equity_curve": equity_curve,
+        "trades": trades[-100:],  # cap payload size
+        "note": "Backtested on synthetic price data (GBM + cycles), not real historical "
+                "broker ticks — treat win rate as a test of the DECISION LOGIC's internal "
+                "consistency, not a promise of live performance. Configure a real market "
+                "data key (see TWELVE_DATA_KEY) to backtest against actual history.",
     }
