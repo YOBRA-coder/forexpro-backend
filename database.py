@@ -70,6 +70,21 @@ def init_db():
             updated_at          TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id             INTEGER REFERENCES users(id),
+            type                TEXT NOT NULL,    -- deposit | withdrawal
+            amount_usd          REAL NOT NULL,
+            method              TEXT,             -- mpesa | manual
+            status              TEXT DEFAULT 'pending', -- pending|completed|rejected
+            phone               TEXT,
+            mpesa_receipt       TEXT,
+            payment_id          INTEGER REFERENCES payments(id),
+            admin_note          TEXT,
+            created_at          TEXT DEFAULT (datetime('now')),
+            processed_at        TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS signals (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id     INTEGER REFERENCES users(id),

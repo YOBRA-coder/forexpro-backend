@@ -50,7 +50,12 @@ SHORTCODE       = os.getenv("MPESA_SHORTCODE", "174379")
 PASSKEY         = os.getenv("MPESA_PASSKEY", "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919")
 CALLBACK_URL    = os.getenv("MPESA_CALLBACK_URL", "https://example.com/payments/mpesa/callback")
 
-REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "1"))
+REGISTRATION_FEE_KES = float(os.getenv("REGISTRATION_FEE_KES", "250"))
+# Only used to convert a KES wallet deposit into the platform's internal USD ledger
+# unit (all trading math — margin, pip value — is USD-denominated). Update this to
+# roughly track the real KES/USD rate; it is NOT a live FX feed.
+USD_KES_RATE = float(os.getenv("USD_KES_RATE", "129"))
+MIN_WITHDRAWAL_USD = float(os.getenv("MIN_WITHDRAWAL_USD", "10"))
 SUBSCRIPTION_PRICES_KES = {
     "trader_pro":     1,
     "trader_elite":   1,
@@ -103,8 +108,9 @@ def normalize_phone(phone: str) -> str:
 
 class StkPushReq(BaseModel):
     phone: str
-    kind: str            # registration | subscription
-    plan: Optional[str] = None   # required if kind == subscription
+    kind: str            # registration | subscription | wallet_deposit
+    plan: Optional[str] = None    # required if kind == subscription
+    amount_usd: Optional[float] = None  # required if kind == wallet_deposit
 
 
 class StatusReq(BaseModel):
@@ -123,8 +129,13 @@ async def stk_push(req: StkPushReq, user=Depends(get_current_user)):
             raise HTTPException(400, f"Unknown plan: {req.plan}")
         amount = SUBSCRIPTION_PRICES_KES[req.plan]
         desc = f"ForexPro {req.plan} — monthly"
+    elif req.kind == "wallet_deposit":
+        if not req.amount_usd or req.amount_usd <= 0:
+            raise HTTPException(400, "amount_usd must be a positive number")
+        amount = round(req.amount_usd * USD_KES_RATE, 2)
+        desc = f"ForexPro wallet deposit (${req.amount_usd:.2f})"
     else:
-        raise HTTPException(400, "kind must be 'registration' or 'subscription'")
+        raise HTTPException(400, "kind must be 'registration', 'subscription', or 'wallet_deposit'")
 
     token = get_access_token()
     password, timestamp = _password_and_timestamp()
@@ -153,12 +164,17 @@ async def stk_push(req: StkPushReq, user=Depends(get_current_user)):
 
     checkout_id = result.get("CheckoutRequestID")
     with get_db() as db:
-        db.execute("""
+        cur = db.execute("""
             INSERT INTO payments (user_id, provider, kind, plan, amount, currency, status,
                                    checkout_request_id, merchant_request_id, phone, raw_response)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (user["id"], "mpesa", req.kind, req.plan, amount, "KES", "pending",
               checkout_id, result.get("MerchantRequestID"), phone, json.dumps(result)))
+        if req.kind == "wallet_deposit":
+            db.execute("""INSERT INTO wallet_transactions
+                (user_id, type, amount_usd, method, status, phone, payment_id)
+                VALUES (?,'deposit',?,'mpesa','pending',?,?)""",
+                (user["id"], req.amount_usd, phone, cur.lastrowid))
     return {
         "success": True,
         "checkout_request_id": checkout_id,
@@ -217,12 +233,22 @@ async def mpesa_callback(payload: dict):
                     )
                     if "provider" in plan:
                         db.execute("UPDATE users SET role='provider' WHERE id=?", (row["user_id"],))
+                elif row["kind"] == "wallet_deposit":
+                    amount_usd = round(row["amount"] / USD_KES_RATE, 2)
+                    db.execute("UPDATE users SET balance = balance + ?, mpesa_phone=? WHERE id=?",
+                               (amount_usd, row["phone"], row["user_id"]))
+                    db.execute("""UPDATE wallet_transactions SET status='completed', mpesa_receipt=?,
+                                  processed_at=datetime('now') WHERE payment_id=?""", (receipt, row["id"]))
                 db.execute(
                     "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
                     (row["user_id"], "system", "Payment Successful ✅",
                      f"Your M-Pesa payment of KES {row['amount']:.0f} was received. Receipt: {receipt or 'N/A'}")
                 )
             else:
+                if row["kind"] == "wallet_deposit":
+                    db.execute("""UPDATE wallet_transactions SET status='rejected',
+                                  admin_note='M-Pesa payment cancelled/timed out', processed_at=datetime('now')
+                                  WHERE payment_id=?""", (row["id"],))
                 db.execute(
                     "INSERT INTO notifications (user_id, type, title, message) VALUES (?,?,?,?)",
                     (row["user_id"], "system", "Payment Not Completed ⚠️",

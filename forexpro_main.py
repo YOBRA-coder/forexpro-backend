@@ -22,7 +22,7 @@ from database import get_db, init_db, hash_password, verify_password, is_subscri
 from signals import (get_ohlcv, add_indicators, build_signal, get_live_quote,
                      PAIR_CONFIG, TF_MAP, detect_support_resistance,
                      detect_trendline, build_markers, pip_value_usd, compute_margin_usd, run_backtest,
-                     compute_risk_based_lot)
+                     compute_risk_based_lot, _low_liquidity_window)
 from payments import router as payments_router
 from mpesa import router as mpesa_router
 from bridge import router as bridge_router
@@ -409,16 +409,36 @@ def _expand_signal(row: dict) -> dict:
             pass
     return {**d, **extra}
 
+SIGNAL_DELAY_MINUTES = {"free": 15, "trader_pro": 0, "trader_elite": 0, "provider_pro": 0}
+
 @app.get("/signals/latest")
 def latest_signals(limit: int = Query(20), user=Depends(get_optional_user)):
+    plan = effective_plan(dict(user)) if user else "free"
+    delay = SIGNAL_DELAY_MINUTES.get(plan, 15)
     with get_db() as db:
-        rows = db.execute("""
-            SELECT s.*, u.username as provider_name
-            FROM signals s LEFT JOIN users u ON s.provider_id=u.id
-            WHERE s.status='active'
-            ORDER BY s.created_at DESC LIMIT ?
-        """, (limit,)).fetchall()
-        return {"signals": [_expand_signal(r) for r in rows]}
+        if delay > 0:
+            rows = db.execute("""
+                SELECT s.*, u.username as provider_name
+                FROM signals s LEFT JOIN users u ON s.provider_id=u.id
+                WHERE s.status='active' AND s.created_at <= datetime('now', ?)
+                ORDER BY s.created_at DESC LIMIT ?
+            """, (f'-{delay} minutes', limit)).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT s.*, u.username as provider_name
+                FROM signals s LEFT JOIN users u ON s.provider_id=u.id
+                WHERE s.status='active'
+                ORDER BY s.created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+        # Let the free-tier UI show "N real-time signals available on Pro" rather
+        # than just silently having fewer results with no explanation.
+        realtime_count = 0
+        if delay > 0:
+            realtime_count = db.execute(
+                "SELECT COUNT(*) c FROM signals WHERE status='active' AND created_at > datetime('now', ?)",
+                (f'-{delay} minutes',)).fetchone()["c"]
+        return {"signals": [_expand_signal(r) for r in rows],
+                "plan_delay_minutes": delay, "realtime_signals_locked": realtime_count}
 
 @app.get("/signals/backtest")
 def backtest_signal_engine(pair: str = "EURUSD", timeframe: str = "H1", bars: int = 1000,
@@ -577,6 +597,10 @@ def copy_signal_manually(signal_id: int, req: CopySignalReq, user=Depends(get_cu
             u = db.execute("SELECT bridge_token FROM users WHERE id=?", (user["id"],)).fetchone()
             if not u or not u["bridge_token"]:
                 raise HTTPException(400, "Connect your MT5 bridge in Profile first (Profile > MT5 Auto-Trading)")
+            closed = _low_liquidity_window()
+            if closed:
+                raise HTTPException(400, f"Can't place a live order right now — {closed.lower()}. "
+                                          f"Simulated copy is still available.")
             live = True
 
         fresh_balance = db.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
@@ -596,10 +620,6 @@ def copy_signal_manually(signal_id: int, req: CopySignalReq, user=Depends(get_cu
              sig["entry_price"], sig["stop_loss"], sig["take_profit"], status0, exec_mode, margin))
         # Reserve the margin immediately — it's released back (plus/minus P&L) on close
         db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Signal Copied",
-                    f"You've copied {sig['pair']} {sig['direction']} at {sig['entry_price']:.5f} "
-                    f"with SL {sig['stop_loss']:.5f} and TP {sig['take_profit']:.5f}."))
         return {"copied": True, "copy_trade_id": cur.lastrowid, "pair": sig["pair"],
                 "direction": sig["direction"], "execution_mode": exec_mode, "margin_reserved": margin,
                 "lot_size": computed_lot}
@@ -640,9 +660,6 @@ def place_quick_trade(req: QuickTradeReq, user=Depends(get_current_user)):
             (user["id"], req.lot_size, 2.0, round(entry, 5), round(sl, 5), round(tp, 5), status0, exec_mode,
              margin, req.pair, req.direction))
         db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Quick Trade Placed",
-                    f"Your quick trade for {req.pair} has been placed at {entry:.5f} with SL {sl:.5f} and TP {tp:.5f}."))
         return {"placed": True, "copy_trade_id": cur.lastrowid, "entry_price": round(entry, 5),
                 "stop_loss": round(sl, 5), "take_profit": round(tp, 5), "margin_reserved": margin,
                 "execution_mode": exec_mode, "pair": req.pair, "direction": req.direction}
@@ -676,9 +693,6 @@ def close_trade_manually(trade_id: int, user=Depends(get_current_user)):
             VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (user["id"], pair, direction, t["entry_price"], close_price, t["lot_size"], pnl_usd, pnl_pips,
              "Manually closed", "Auto (Copy Trade)" if t["signal_id"] else "Auto (Quick Trade)"))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Trade Closed",
-                    f"Your copy trade for {pair} has been closed at {close_price:.5f}. P&L: ${pnl_usd:.2f} ({pnl_pips:.1f} pips)."))
         return {"closed": True, "close_price": close_price, "pnl_usd": round(pnl_usd, 2), "pnl_pips": round(pnl_pips, 1)}
 
 @app.post("/copy/trades/{trade_id}/approve")
@@ -700,8 +714,6 @@ def approve_pending_copy(trade_id: int, user=Depends(get_current_user)):
             raise HTTPException(400, f"Insufficient balance — needs ${margin:.2f} margin, you have ${balance:.2f}")
         db.execute("UPDATE copy_trades SET status='open', margin_used=?, opened_at=datetime('now') WHERE id=?", (margin, trade_id))
         db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (margin, user["id"]))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Copy Trade Approved", f"You approved a copy trade for {pair}. ${margin:.2f} margin has been reserved."))
         return {"approved": True, "margin_reserved": margin}
 
 @app.post("/copy/trades/{trade_id}/decline")
@@ -711,8 +723,6 @@ def decline_pending_copy(trade_id: int, user=Depends(get_current_user)):
                         (trade_id, user["id"])).fetchone()
         if not t: raise HTTPException(404, "Pending trade not found")
         db.execute("UPDATE copy_trades SET status='declined' WHERE id=?", (trade_id,))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Copy Trade Declined", "You declined a copy trade suggestion. No margin was reserved."))
         return {"declined": True}
 
 @app.get("/providers")
@@ -787,9 +797,6 @@ def unsubscribe(provider_id: int, user=Depends(get_current_user)):
                    (user["id"], provider_id))
         db.execute("UPDATE providers SET followers_count=MAX(0,followers_count-1) WHERE user_id=?",
                    (provider_id,))
-        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
-                   (user["id"], "copy", "Unsubscribed from Provider",
-                    "You will no longer receive signals from this provider."))
         return {"success": True}
 
 @app.get("/copy/my-trades")
@@ -977,6 +984,86 @@ def get_journal(user=Depends(get_current_user)):
                           "best_trade": round(best,2), "worst_trade": round(worst,2)}}
 
 # ── Notifications ─────────────────────────────────────────────────────────────
+# ── Wallet ────────────────────────────────────────────────────────────────────
+class WithdrawReq(BaseModel):
+    amount_usd: float
+    phone: str
+
+@app.get("/wallet/summary")
+def wallet_summary(user=Depends(get_current_user)):
+    with get_db() as db:
+        fresh = db.execute("SELECT balance, equity FROM users WHERE id=?", (user["id"],)).fetchone()
+        pending_withdrawals = db.execute(
+            "SELECT COALESCE(SUM(amount_usd),0) FROM wallet_transactions WHERE user_id=? AND type='withdrawal' AND status='pending'",
+            (user["id"],)).fetchone()[0]
+        return {"balance": fresh["balance"], "equity": fresh["equity"],
+                "pending_withdrawals_usd": pending_withdrawals}
+
+@app.get("/wallet/transactions")
+def wallet_transactions(user=Depends(get_current_user)):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM wallet_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 50",
+            (user["id"],)).fetchall()
+        return {"transactions": [dict(r) for r in rows]}
+
+@app.post("/wallet/withdraw/request")
+def request_withdrawal(req: WithdrawReq, user=Depends(get_current_user)):
+    """Queues a withdrawal request and reserves the funds immediately (so the same
+    balance can't be withdrawn twice or spent on a trade while pending). Actual
+    payout (M-Pesa B2C or bank transfer) is NOT automated — Safaricom B2C requires
+    a separate business registration/approval beyond what STK push (receiving
+    payments) needs, so this creates a request an admin fulfills manually and
+    marks complete via /wallet/withdrawals/{id}/approve."""
+    if req.amount_usd <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    with get_db() as db:
+        balance = db.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
+        if balance < req.amount_usd:
+            raise HTTPException(400, f"Insufficient balance — you have ${balance:.2f}")
+        db.execute("UPDATE users SET balance = balance - ? WHERE id=?", (req.amount_usd, user["id"]))
+        cur = db.execute("""INSERT INTO wallet_transactions
+            (user_id, type, amount_usd, method, status, phone)
+            VALUES (?,'withdrawal',?,'mpesa','pending',?)""",
+            (user["id"], req.amount_usd, req.phone))
+        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
+            (user["id"], "billing", "Withdrawal requested",
+             f"${req.amount_usd:.2f} reserved and queued for payout to {req.phone}. "
+             f"This is processed manually — you'll get a notification once it's sent."))
+        return {"requested": True, "transaction_id": cur.lastrowid}
+
+@app.post("/wallet/withdrawals/{tx_id}/approve")
+def approve_withdrawal(tx_id: int, mpesa_receipt: str = "", user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    with get_db() as db:
+        tx = db.execute("SELECT * FROM wallet_transactions WHERE id=? AND type='withdrawal' AND status='pending'",
+                        (tx_id,)).fetchone()
+        if not tx: raise HTTPException(404, "Pending withdrawal not found")
+        db.execute("""UPDATE wallet_transactions SET status='completed', mpesa_receipt=?,
+                      processed_at=datetime('now') WHERE id=?""", (mpesa_receipt, tx_id))
+        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
+            (tx["user_id"], "billing", "Withdrawal sent ✅",
+             f"${tx['amount_usd']:.2f} has been sent to {tx['phone']}." +
+             (f" M-Pesa ref: {mpesa_receipt}" if mpesa_receipt else "")))
+        return {"approved": True}
+
+@app.post("/wallet/withdrawals/{tx_id}/reject")
+def reject_withdrawal(tx_id: int, reason: str = "", user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    with get_db() as db:
+        tx = db.execute("SELECT * FROM wallet_transactions WHERE id=? AND type='withdrawal' AND status='pending'",
+                        (tx_id,)).fetchone()
+        if not tx: raise HTTPException(404, "Pending withdrawal not found")
+        db.execute("""UPDATE wallet_transactions SET status='rejected', admin_note=?,
+                      processed_at=datetime('now') WHERE id=?""", (reason, tx_id))
+        db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (tx["amount_usd"], tx["user_id"]))
+        db.execute("""INSERT INTO notifications (user_id,type,title,message) VALUES (?,?,?,?)""",
+            (tx["user_id"], "billing", "Withdrawal declined",
+             f"${tx['amount_usd']:.2f} was returned to your balance. Reason: {reason or 'Not specified'}"))
+        return {"rejected": True}
+
 @app.get("/notifications")
 def get_notifications(user=Depends(get_current_user)):
     with get_db() as db:

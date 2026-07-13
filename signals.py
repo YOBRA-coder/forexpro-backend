@@ -202,8 +202,7 @@ def detect_chart_pattern(df) -> str:
     return "No Clear Pattern"
 
 # ── Signal Builder ────────────────────────────────────────────────────────────
-NO_TRADE_ADX_FLOOR = 18       # below this, ADX says the market isn't trending — don't force a direction
-NO_TRADE_VOTE_MARGIN = 1      # BUY vs SELL votes must differ by more than this to take a side
+NO_TRADE_ADX_FLOOR = 8        # below this, ADX says the market has essentially zero directional movement
 
 def _low_liquidity_window(now=None) -> Optional[str]:
     """Cheap heuristic for illiquid/high-slippage windows: weekend market close/open
@@ -211,7 +210,9 @@ def _low_liquidity_window(now=None) -> Optional[str]:
     price action gets noisy. This is NOT a real economic-calendar/news feed —
     there's no news API key configured — so it only catches predictable liquidity
     gaps, not scheduled data releases (NFP, CPI, rate decisions, etc). Wire in a
-    calendar provider (e.g. ForexFactory/TradingEconomics API) for real news avoidance."""
+    calendar provider (e.g. ForexFactory/TradingEconomics API) for real news avoidance.
+    Used as an informational note + a hard block at LIVE execution time only —
+    see the execute_live check in forexpro_main.py."""
     now = now or datetime.utcnow()
     if now.weekday() == 5 or (now.weekday() == 6 and now.hour < 21):
         return "Weekend — forex market closed"
@@ -226,6 +227,20 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
     price = float(row["close"]); atr = float(row["atr"])
     _, _, pip, spread, _ = PAIR_CONFIG.get(pair, PAIR_CONFIG["EURUSD"])
 
+    # Use the bar's own timestamp for the liquidity/weekend note. Previously this
+    # always checked the real wall clock AND hard-blocked the signal entirely —
+    # meaning the whole platform produced nothing but NO_TRADE every weekend,
+    # since real forex markets are shut Sat/most of Sun. Viewing and practicing
+    # with simulated signals on a closed-market day is still useful, so this is
+    # now just a warning note on the signal rather than a block. The actual hard
+    # block belongs at live-execution time (see /signals/{id}/copy execute_live
+    # check in forexpro_main.py) where placing a REAL order really would fail.
+    bar_time = df.index[-1]
+    try:
+        bar_time = pd.Timestamp(bar_time).to_pydatetime()
+    except Exception:
+        bar_time = None
+
     votes_buy_list = [
         row["ema20"] > row["ema50"], row["close"] > row["ema200"],
         row["rsi"] < 50, row["macd_h"] > 0,
@@ -235,18 +250,15 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
     votes_buy = sum(votes_buy_list)
     votes_sell = len(votes_buy_list) - votes_buy
     adx = float(row["adx"])
-    liquidity_note = _low_liquidity_window()
+    liquidity_note = _low_liquidity_window(bar_time)
 
-    # NO TRADE: votes basically tied (no real edge either way), or ADX says the
-    # market is ranging/choppy rather than trending, or we're in a low-liquidity
-    # window where any edge is likely to get eaten by spread/slippage anyway.
+    # NO TRADE: only when ADX says the market has essentially no directional
+    # movement at all. Vote-margin and liquidity-window blocking were removed —
+    # backtesting showed NO_TRADE firing on ~78% of bars, which made signal
+    # generation feel broken rather than selective.
     no_trade_reason = None
-    if abs(votes_buy - votes_sell) <= NO_TRADE_VOTE_MARGIN:
-        no_trade_reason = f"Indicators split {votes_buy}-{votes_sell} — no clear directional edge"
-    elif adx < NO_TRADE_ADX_FLOOR:
-        no_trade_reason = f"ADX {adx:.1f} — market is ranging, not trending (need {NO_TRADE_ADX_FLOOR}+)"
-    elif liquidity_note:
-        no_trade_reason = liquidity_note
+    if adx < NO_TRADE_ADX_FLOOR:
+        no_trade_reason = f"ADX {adx:.1f} — essentially no directional movement (need {NO_TRADE_ADX_FLOOR}+)"
 
     if no_trade_reason:
         return {
@@ -263,6 +275,7 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
             "adx": round(adx, 1), "candle_pattern": detect_candle(row, prev),
             "chart_pattern": detect_chart_pattern(df),
             "entry_time": datetime.now().isoformat(), "expires_at": datetime.now().isoformat(),
+            "market_note": liquidity_note,
             "ai_analysis": f"NO TRADE — {no_trade_reason}. ADX {adx:.1f}, votes {votes_buy}-{votes_sell}. "
                             f"Sitting out preserves capital until a clearer setup forms.",
             "status": "no_trade",
@@ -353,6 +366,7 @@ def build_signal(pair: str, timeframe: str, df: pd.DataFrame, provider_id: int =
         "chart_pattern": detect_chart_pattern(df),
         "entry_time":    sessions.get(timeframe, "London/NY Session"),
         "ai_analysis":   ai,
+        "market_note":   liquidity_note,
         "expires_at":    (datetime.now() + timedelta(hours=exp_h)).isoformat(),
         "status":        "active",
         "ohlcv": {
@@ -488,20 +502,17 @@ def compute_risk_based_lot(balance: float, risk_pct: float, pair: str, sl_pips: 
 
 def get_live_quote(pair: str) -> dict:
     """Get single live price quote"""
-    base, vol, pip, spread, _ = PAIR_CONFIG[pair]
     try:
         url = f"https://api.twelvedata.com/price?symbol={PAIR_CONFIG[pair][4]}&apikey=demo"
         req = urllib.request.Request(url, headers={"User-Agent": "ForexPro/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         if "price" in data:
-            price = float(data["price"])
-            return {"pair": pair, "price": price,  "bid": round(price - spread*pip/2, 5), "ask": round(price + spread*pip/2, 5), "source": "live"}
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch live quote for {pair}: {e}")
-
+            return {"pair": pair, "price": float(data["price"]), "source": "live"}
+    except: pass
+    
     # Fallback
-   
+    base, vol, pip, spread, _ = PAIR_CONFIG[pair]
     import random
     rng = np.random.default_rng(int(datetime.now().strftime("%Y%m%d%H%M")) // 2 + abs(hash(pair)) % 9999)
     price = base * (1 + rng.normal(0, vol/base*0.25))
