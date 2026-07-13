@@ -859,7 +859,7 @@ def live_prices(pairs: str = Query("EURUSD,GBPUSD,USDJPY,AUDUSD,XAUUSD,BTCUSD"))
     return {"prices": prices, "updated_at": datetime.now().isoformat()}
 
 @app.get("/prices/chart")
-def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 500):
+def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 1000):
     if pair not in PAIR_CONFIG: raise HTTPException(400, "Unknown pair")
     if timeframe not in TF_MAP: raise HTTPException(400, "Unknown timeframe")
     df = get_ohlcv(pair, timeframe, candles + 250)
@@ -1254,7 +1254,7 @@ async def ws_signals(websocket: WebSocket):
         manager.disconnect("signals", websocket)
 
 AUTO_SIGNAL_ROTATION = [("EURUSD","H1"), ("GBPUSD","M30"), ("XAUUSD","H1"),
-                         ("USDJPY","M15"), ("BTCUSD","H1"), ("GBPJPY","H4")]
+                         ("USDJPY","M15"), ("BTCUSD","H1"), ("GBPJPY","H4"), ("EURUSD","M15")]
 
 async def auto_signal_loop():
     """Generates a fresh AI signal on rotation and broadcasts it, so /ws/signals stays live
