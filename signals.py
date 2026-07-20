@@ -12,7 +12,7 @@ from typing import Optional
 import urllib.request, urllib.error
 
 # ── Twelve Data free API (no key needed for basic quotes) ─────────────────────
-TWELVE_DATA_KEY = ""  # Optional: get free key at twelvedata.com for more calls
+TWELVE_DATA_KEY = "de90b951eec24698a8dd04c92195b735"  # Optional: get free key at twelvedata.com for more calls
 
 PAIR_CONFIG = {
     "EURUSD": (1.0850, 0.0050, 0.0001, 1.2, "EUR/USD"),
