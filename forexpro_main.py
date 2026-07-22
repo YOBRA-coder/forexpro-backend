@@ -240,7 +240,7 @@ def generate_signal(req: GenerateSignalReq, user=Depends(get_current_user)):
             raise HTTPException(403, f"Free plan is limited to {limits['signals_per_day']} signals/day — "
                                       f"you've used all {used}. Upgrade to Pro for unlimited signals.")
 
-    df = get_ohlcv(req.pair, req.timeframe, 250)
+    df = get_ohlcv(req.pair, req.timeframe, 550)
     df = add_indicators(df)
     sig = build_signal(req.pair, req.timeframe, df, provider_id=user["id"])
 
@@ -859,7 +859,7 @@ def live_prices(pairs: str = Query("EURUSD,GBPUSD,USDJPY,AUDUSD,XAUUSD,BTCUSD"))
     return {"prices": prices, "updated_at": datetime.now().isoformat()}
 
 @app.get("/prices/chart")
-def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 1000):
+def price_chart(pair: str = "EURUSD", timeframe: str = "H1", candles: int = 2000):
     if pair not in PAIR_CONFIG: raise HTTPException(400, "Unknown pair")
     if timeframe not in TF_MAP: raise HTTPException(400, "Unknown timeframe")
     df = get_ohlcv(pair, timeframe, candles + 250)
@@ -1168,7 +1168,7 @@ def broadcast_threadsafe(channel: str, message: dict):
     except Exception as e:
         print(f"[WS] broadcast failed: {e}")
 
-DEFAULT_TICK_PAIRS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","XAUUSD","BTCUSD"]
+DEFAULT_TICK_PAIRS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","AUDNZD","CADJPY","CHFJPY","EURAUD","EURCAD","EURNZD","GBPAUD","GBPCAD","GBPNZD","NZDJPY"];
 
 async def price_broadcaster_loop():
     """Background task: pushes fresh quotes to all /ws/prices subscribers every ~1.5s."""
@@ -1204,7 +1204,7 @@ async def ws_candles(websocket: WebSocket, pair: str = "EURUSD", timeframe: str 
     try:
         while True:
             try:
-                df = get_ohlcv(pair, timeframe, 260)
+                df = get_ohlcv(pair, timeframe, 560)
                 df = add_indicators(df)
                 last_ts = str(df.index[-1])[:16]
                 quote = get_live_quote(pair)
@@ -1253,8 +1253,8 @@ async def ws_signals(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect("signals", websocket)
 
-AUTO_SIGNAL_ROTATION = [("EURUSD","H1"), ("GBPUSD","M30"), ("XAUUSD","H1"),
-                         ("USDJPY","M15"), ("BTCUSD","H1"), ("GBPJPY","H4"), ("EURUSD","M15")]
+AUTO_SIGNAL_ROTATION = [("EURUSD","H1"), ("GBPUSD","M30"), ("EURUSD","M5"), ("EURUSD","M30"), ("EURUSD","H4")
+                         ("EURAUD","M15"), ("EURAUD","H1"), ("GBPJPY","H4"), ("EURUSD","M15")]
 
 async def auto_signal_loop():
     """Generates a fresh AI signal on rotation and broadcasts it, so /ws/signals stays live

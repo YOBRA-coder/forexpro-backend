@@ -26,7 +26,7 @@ PAIR_CONFIG = {
     "EURJPY": (162.20, 0.75,   0.01,   1.1, "EUR/JPY"),
     "GBPJPY": (190.50, 1.20,   0.01,   1.3, "GBP/JPY"),
     "XAUUSD": (2320.0, 8.0,    0.1,    3.0, "XAU/USD"),
-    "EURAUD": (1.4777,0.500, 1.0,   25.0, "EUR/AUD"),
+    "BTCUSD": (68000.0,1500.0, 1.0,   25.0, "BTC/USD"),
 }
 
 TF_MAP = {
@@ -102,7 +102,7 @@ def synthetic_ohlcv(pair: str, timeframe: str, n: int = 300, seed: int = None) -
 
 def get_ohlcv(pair: str, timeframe: str, n: int = 200) -> pd.DataFrame:
     """Get OHLCV — tries live first, falls back to synthetic"""
-    if timeframe in ("M1","M5","M15","M30","H1", "H4", "D1"):  # Live data available for these
+    if timeframe in ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"):  # Live data available for these
         live = fetch_live_ohlcv(pair, timeframe, min(n, 500))
         if live is not None and len(live) >= 50:
             return live.tail(n)
