@@ -102,7 +102,7 @@ def synthetic_ohlcv(pair: str, timeframe: str, n: int = 300, seed: int = None) -
 
 def get_ohlcv(pair: str, timeframe: str, n: int = 200) -> pd.DataFrame:
     """Get OHLCV — tries live first, falls back to synthetic"""
-    if timeframe in ("H1", "H4", "D1"):  # Live data available for these
+    if timeframe in ("M1","M5","M15","M30","H1", "H4", "D1"):  # Live data available for these
         live = fetch_live_ohlcv(pair, timeframe, min(n, 500))
         if live is not None and len(live) >= 50:
             return live.tail(n)
